@@ -1,135 +1,211 @@
----
-title: DataCentric-Env
-emoji: 🧹
-colorFrom: blue
-colorTo: green
-sdk: docker
-app_port: 7860
-pinned: false
----
-
 # DataCentric-Env
 
-An RL environment for training LLM agents to improve dataset quality.
-Instead of changing the model — improve the data.
+**An RL environment that trains an LLM to act as a data engineer.**
 
-## The Problem
+The agent receives a real, messy tabular dataset and a frozen classifier it cannot touch. Its only job: fix the data until the classifier hits the accuracy target — measured against published academic benchmarks.
 
-AI labs spend enormous resources on data annotation and cleaning.
-DataCentric-Env trains an agent to do this automatically — dispatching
-specialist tools to fix a degraded dataset until a fixed classifier's
-accuracy crosses a target threshold.
+---
 
-## How It Works
+## The Problem This Solves
 
-- **Observation**: The agent receives dataset statistics (missing value rate, class balance ratio, current accuracy, budget remaining).
-- **Action**: The agent selects one of five specialist tools and parameters (JSON format).
-- **Reward**: A 5-component reward function scores format compliance, accuracy improvement, dataset quality improvement, efficiency, and task completion.
-- **Done**: Episode ends when accuracy reaches the target threshold OR budget is exhausted.
+Most RL environments for LLMs test reasoning on synthetic puzzles. Real data engineering requires **domain reasoning** — knowing that `Glucose=0` is medically impossible, that `capital-gain` needs a log transform, that removing 30% of rows will hurt generalization even if it improves cross-validation accuracy.
 
-## Specialist Tools
+This environment forces the agent to develop that domain knowledge by grounding rewards in **published accuracy benchmarks** on real UCI datasets.
 
-| Tool | What it does |
-|------|-------------|
-| cleaner | Imputes missing values (median/mean) or drops incomplete rows |
-| augmenter | Generates synthetic minority-class samples via SMOTE |
-| balancer | Resamples to fix class skew via undersampling |
-| relabeler | Queries label oracle to correct mislabeled rows (costs 2 budget points) |
-| validator | Detects and removes duplicates, reports dataset health |
+---
 
-## Reward Function
+## Live Demo
 
-Five independent graders, weighted average — all strictly in `(0.001, 0.999)`:
+**Environment server:** https://huggingface.co/spaces/Aswini-Kumar/datacentric-env
+
+- `GET /docs` — Interactive Swagger UI
+- `GET /health` — Status + active sessions
+- `POST /reset` — Start a new episode
+
+---
+
+## The 5 Real Datasets
+
+| Dataset | Domain | Published Baseline | Key Issues |
+|---|---|---|---|
+| [UCI Adult Census](https://archive.ics.uci.edu/dataset/2/adult) | Income prediction | **87.1%** | 14% `?` missing, capital-gain 97% zero, education/education-num redundant |
+| [Pima Indians Diabetes](https://www.openml.org/d/37) | Medical diagnosis | **77.0%** | Glucose=0, BloodPressure=0, BMI=0 are medically impossible (zeros = missing) |
+| [Wisconsin Breast Cancer](https://scikit-learn.org/stable/datasets/toy_dataset.html) | Medical imaging | **97.3%** | Correlated feature groups, outliers represent real rare tumors |
+| [German Credit Risk](https://www.openml.org/d/31) | Credit risk | **76.8%** | Mixed categorical + numeric, 70/30 imbalance |
+| [Cleveland Heart Disease](https://www.openml.org/d/1497) | Medical diagnosis | **85.5%** | 303 rows, real missing values in `ca` and `thal` |
+
+Datasets download automatically on first run and are cached locally. The server pre-loads all 5 at startup via a background thread.
+
+---
+
+## Architecture
+
+```
+POST /reset  →  Load real dataset  →  80/20 train/holdout split
+               Agent sees train set (domain + known issues)
+               Holdout is FROZEN — agent never sees or modifies it
+
+POST /step   →  Query a specialist agent
+               Agent reads recommendations (domain-informed)
+               Agent applies the best recommendation
+
+               Score = accuracy on FROZEN holdout
+               Compared against published benchmark
+```
+
+### 5 Specialist Agents
+
+| Agent | Action | What it does |
+|---|---|---|
+| **CleanerAgent** | `query_cleaner` | Missing values + zero-as-missing (domain-aware) + log-transform for skewed features |
+| **AugmenterAgent** | `query_augmenter` | SMOTE-like interpolation to synthesize minority class rows |
+| **BalancerAgent** | `query_balancer` | Oversample/undersample with explicit tradeoff explanation |
+| **ValidatorAgent** | `query_validator` (cost 2) | Duplicates + outlier clipping (conservative 5× IQR for medical domains) |
+| **AnalystAgent** | `query_analyst` (cost 2) | Holistic diagnosis + prioritized action plan + published baseline reference |
+
+### What's Domain-Aware
+
+The CleanerAgent knows:
+- In `medical_diagnosis` datasets: zeros in physiological measurements are impossible — they're missing values → `zero_to_nan_impute`
+- In `income_prediction` datasets: `capital-gain` has 97% zeros with heavy right skew → `log1p` transform
+- Redundant features (e.g. `education` + `education-num`) → recommend dropping one
+
+The ValidatorAgent knows:
+- In medical domains, use 5× IQR instead of 3× — outliers may be real rare conditions
+- In credit/income domains, use standard 3× IQR
+
+---
+
+## Reward Structure
+
+All rewards strictly in `(0.001, 0.999)`. Every `/step` returns a full decomposition:
 
 | Grader | Weight | What it measures |
-|--------|--------|-----------------|
-| Format compliance | 15% | Valid JSON action with correct agent name and fields |
-| Accuracy improvement | 35% | Progress toward target accuracy threshold |
-| Dataset quality | 20% | Missing value reduction + balance improvement |
-| Efficiency | 15% | Budget use — penalizes wasted steps and reckless relabeler |
-| Task completion | 15% | Whether target threshold was reached |
+|---|---|---|
+| Format | 15% | Valid action with required fields |
+| Accuracy | 35% | Progress toward target on **frozen holdout** |
+| Quality | 20% | Missing% reduction + class balance improvement |
+| Efficiency | 15% | Penalizes wasted steps and low-budget expensive queries |
+| Completion | 15% | Bonus for hitting target, scaled by remaining budget |
 
-## Curriculum
+---
 
-| Episodes | Difficulty | Missing | Noise | Imbalance | Target Acc |
-|----------|-----------|---------|-------|-----------|-----------|
-| 0–20     | easy      | 5%      | 5%    | 0.8       | 0.80      |
-| 20–50    | medium    | 15%     | 15%   | 0.6       | 0.75      |
-| 50+      | hard      | 30%     | 25%   | 0.3       | 0.70      |
+## New in v0.5
 
-## Results
+### Rollback Action
+```json
+{"action": "rollback", "session_id": "..."}
+```
+Undoes the last apply. Max 3 per episode. Costs 1 budget. Real data engineers do this.
 
-![Reward curve](results.png)
+### Episode Reasoning Trace
+Every observation includes the last 5 steps with effects:
+```json
+"episode_trace": [
+  {"step": 2, "type": "apply", "accuracy_delta": 0.031, "effect": "improved"},
+  {"step": 3, "type": "apply", "accuracy_delta": -0.018, "effect": "hurt"}
+]
+```
 
-Trained agent achieves higher mean episode reward vs random baseline.
+### Feature Importance
+Returned after every apply — LogisticRegression coefficients after StandardScaler:
+```json
+"feature_importance": {
+  "top_positive": [{"feature": "Glucose", "coef": 0.84}],
+  "top_negative": [{"feature": "BMI_raw", "coef": -0.32}]
+}
+```
 
-## Environment
+### Regression Explanation
+When accuracy drops after an apply:
+```json
+"regression_explanation": {
+  "likely_cause": "large_augmentation_overfitting",
+  "suggestion": "Synthetic rows don't generalise to holdout. Try undersample_majority or rollback."
+}
+```
 
-Live on HuggingFace: [Aswini-Kumar/datacentric-env](https://huggingface.co/spaces/Aswini-Kumar/datacentric-env)
+### Benchmark Comparison
+```json
+"benchmarks": {
+  "majority_class_baseline": 0.6510,
+  "starting_accuracy": 0.8095,
+  "improvement_over_start": 0.0231,
+  "published_baseline": 0.8710
+}
+```
 
-API:
-- `POST /reset` — Start new episode, returns initial observation
-- `POST /step` — Take action, returns `{observation, reward, done, tool_log, info}`
-- `GET /state` — Get current observation without advancing episode
+---
+
+## API Reference
+
+```
+POST /reset                         Start a new episode
+  body: {difficulty: "easy"|"medium"|"hard", seed?: int}
+
+POST /step                          Take an action
+  body: {session_id, action, rec_id?, target_class?}
+  actions: query_cleaner | query_augmenter | query_balancer |
+           query_validator | query_analyst | apply | rollback
+
+GET  /state/{session_id}            Current observation
+GET  /trajectory/{session_id}       Full episode trace (for offline analysis)
+GET  /health                        Health check
+GET  /metrics                       Server metrics + config
+GET  /docs                          Swagger UI
+```
+
+---
 
 ## Training
 
-- **Model**: Qwen2.5-3B-Instruct
-- **Method**: GRPO via TRL + Unsloth
-- **Training script**: [training/train.py](training/train.py)
-- **Colab notebook**: [training/train.ipynb](training/train.ipynb)
-- **GitHub**: https://github.com/CelestialWorthyOfHeavenAndEarth/DataCentric-Env
+The training script (`training/train.py`) runs GRPO via TRL + Unsloth on Colab (T4 GPU).
 
-## Quick Start
+```python
+# Set your HF Space URL
+ENV_URL = "https://aswini-kumar-datacentric-env.hf.space"
 
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Run server locally
-uvicorn server.main:app --reload --port 8000
-
-# Test client
-python client/client.py
-
-# Run automated checks
-python inference.py
-
-# Evaluate baseline
-python evaluate.py
+# Then run training/train.py
+# - Collects 60 episodes across easy/medium/hard difficulty
+# - Trains Qwen2.5-3B-Instruct with LoRA r=16
+# - Saves results.png with reward progression + distribution charts
+# - Saves merged model to ./datacentric-grpo-final
 ```
 
-## File Structure
+---
+
+## Anti-Exploit Rules
+
+| Rule | What it blocks |
+|---|---|
+| `action_spam` | Same query 3+ times in a row |
+| `low_budget_expensive_query` | Cost-2 queries when budget ≤ 2 |
+| `duplicate_apply` | Applying the same rec_id twice |
+| `invalid_rec_id` | Applying a rec_id that doesn't exist |
+| `data_integrity_violation` | Deleting >10% of training rows in one operation |
+
+---
+
+## Project Structure
 
 ```
 datacentric-env/
-├── openenv.yaml               # OpenEnv manifest
-├── requirements.txt
-├── Dockerfile                 # HuggingFace Spaces deployment
-├── inference.py               # Phase 1/2 automated check entry point
-├── evaluate.py                # Baseline vs trained agent comparison
 ├── server/
-│   ├── main.py                # FastAPI app
-│   ├── environment.py         # Core environment logic
-│   ├── dataset_factory.py     # Dataset generation + corruption
-│   ├── evaluator.py           # sklearn classifier
-│   ├── reward.py              # 5-component reward function
-│   └── specialists/
-│       ├── cleaner.py
-│       ├── augmenter.py
-│       ├── balancer.py
-│       ├── relabeler.py
-│       └── validator.py
-├── client/
-│   └── client.py              # HTTP-only client (never imports server/)
-└── training/
-    ├── train.py               # GRPO training script
-    └── train.ipynb            # Colab notebook (required by judges)
+│   ├── main.py               # FastAPI app (endpoints + startup warmup)
+│   ├── environment.py        # Session-aware RL environment (v0.5)
+│   ├── dataset_registry.py   # Real dataset loader + CSV cache + warmup
+│   ├── evaluator.py          # Train/holdout split evaluator + feature importance
+│   ├── specialist_agents.py  # 5 domain-aware expert systems
+│   ├── reward.py             # 5-component reward function
+│   ├── session_manager.py    # Thread-safe UUID session management
+│   ├── anti_exploit.py       # 5 anti-exploit rules
+│   ├── config.py             # Centralized configuration
+│   └── logger.py             # Structured JSON logging
+├── datasets/                 # Cached real datasets (CSV, git-ignored)
+├── training/
+│   └── train.py              # GRPO training script (Colab)
+├── inference.py              # Automated end-to-end test
+├── openenv.yaml              # Full environment spec
+├── requirements.txt
+└── Dockerfile
 ```
-
-## References
-
-- OpenEnv: https://github.com/meta-pytorch/OpenEnv
-- TRL GRPO: https://huggingface.co/docs/trl
-- Unsloth: https://github.com/unslothai/unsloth
-- Data-Centric AI: https://datacentricai.org

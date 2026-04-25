@@ -1,20 +1,15 @@
 """
-server/dataset_registry.py — Real dataset loader.
+server/dataset_registry.py — Real dataset loader (v0.5).
 
-Uses sklearn's fetch_openml to load 5 well-known public datasets with
-GENUINE quality issues. No artificial corruption injected.
+5 real public datasets with GENUINE quality issues.
+No artificial corruption injected — these are the actual documented problems.
 
-Datasets are cached as parquet after first download so the server
-doesn't need internet access on every restart.
-
-Each dataset ships with domain_metadata that tells specialist agents:
-  - What domain this is (medical, finance, etc.)
-  - What the known real-world issues are
-  - What the published baseline accuracy is
-  - Domain-specific rules (e.g. zero=missing in medical data)
-  - A held-out test split that the agent NEVER sees or modifies
+Datasets are cached as CSV after first download.
+warmup() pre-loads all datasets in a background thread at startup
+so the first /reset call is instant.
 """
 import os
+import threading
 import numpy as np
 import pandas as pd
 from sklearn.datasets import fetch_openml, load_breast_cancer
@@ -34,7 +29,7 @@ REGISTRY = {
         "target_column": "class",
         "published_baseline": 0.871,
         "domain": "income_prediction",
-        "difficulty_weight": 1,  # easy
+        "difficulty_weight": 1,
         "known_issues": [
             "~14% of rows have '?' for occupation, workclass, native-country (real missing data)",
             "capital-gain is 97% zero with heavy right skew — needs log transform",
@@ -44,7 +39,7 @@ REGISTRY = {
         "domain_rules": {
             "zeros_as_missing": [],
             "log_transform_candidates": ["capital-gain", "capital-loss"],
-            "redundant_features": ["education"],  # education-num is numeric equivalent
+            "redundant_features": ["education"],
         },
     },
     "diabetes_pima": {
@@ -55,7 +50,7 @@ REGISTRY = {
         "target_column": "class",
         "published_baseline": 0.770,
         "domain": "medical_diagnosis",
-        "difficulty_weight": 2,  # medium
+        "difficulty_weight": 2,
         "known_issues": [
             "Glucose, BloodPressure, BMI = 0 are medically impossible — zeros mean missing",
             "Insulin has 374 zeros (49% are actually missing)",
@@ -71,11 +66,11 @@ REGISTRY = {
     "breast_cancer": {
         "display_name": "Wisconsin Breast Cancer Diagnostic",
         "description": "Classify tumors as malignant or benign from cell nucleus measurements.",
-        "openml_name": None,  # use sklearn built-in
+        "openml_name": None,  # sklearn built-in, always available
         "target_column": "target",
         "published_baseline": 0.973,
         "domain": "medical_imaging",
-        "difficulty_weight": 1,  # easy (very clean)
+        "difficulty_weight": 1,
         "known_issues": [
             "Several feature groups are highly correlated (mean/SE/worst versions of same measurement)",
             "Some outlier samples represent rare aggressive tumor types — IQR removal is dangerous",
@@ -95,10 +90,10 @@ REGISTRY = {
         "target_column": "class",
         "published_baseline": 0.768,
         "domain": "credit_risk",
-        "difficulty_weight": 2,  # medium
+        "difficulty_weight": 2,
         "known_issues": [
             "Mix of categorical and numeric features — encoding strategy matters",
-            "Cost-sensitive: misclassifying bad credit as good is 5× more expensive",
+            "Cost-sensitive: misclassifying bad credit as good is 5x more expensive",
             "Class imbalance: 70% good credit, 30% bad credit",
             "Several ordinal features encoded as integers — scaling affects model significantly",
         ],
@@ -116,7 +111,7 @@ REGISTRY = {
         "target_column": "class",
         "published_baseline": 0.855,
         "domain": "medical_diagnosis",
-        "difficulty_weight": 3,  # hard
+        "difficulty_weight": 3,
         "known_issues": [
             "Real missing values in: ca (4 missing), thal (2 missing)",
             "Target is originally 0-4 severity scale — binarized as 0 vs >0",
@@ -138,41 +133,52 @@ DIFFICULTY_TO_DATASETS = {
 }
 
 
-# ── Dataset loading ────────────────────────────────────────────────────────────
+# ── Registry class ─────────────────────────────────────────────────────────────
 
 class DatasetRegistry:
     """Loads, caches, and serves real datasets with train/holdout splits."""
 
     def __init__(self):
         os.makedirs(CACHE_DIR, exist_ok=True)
-        self._cache: dict[str, pd.DataFrame] = {}
-        self._rotation: dict[str, int] = {d: 0 for d in DIFFICULTY_TO_DATASETS}
+        self._cache: dict = {}
+        self._rotation: dict = {d: 0 for d in DIFFICULTY_TO_DATASETS}
 
-    def get(self, difficulty: str = "easy", seed: int = None) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
+    def warmup(self):
+        """
+        Pre-load all 5 datasets in a background thread at server startup.
+        Eliminates the 30-60s OpenML download delay on the first /reset call.
+        Datasets are cached to disk — subsequent server restarts load instantly.
+        """
+        def _load_all():
+            print("[DatasetRegistry] Warmup: pre-loading all datasets...")
+            for name, meta in REGISTRY.items():
+                try:
+                    df = self._load(name, meta)
+                    print(f"[DatasetRegistry]  OK {name} ({len(df)} rows, {df.shape[1]} cols)")
+                except Exception as e:
+                    print(f"[DatasetRegistry]  FAIL {name}: {e}")
+            print("[DatasetRegistry] Warmup complete — all datasets ready.")
+        threading.Thread(target=_load_all, daemon=True).start()
+
+    def get(self, difficulty: str = "easy", seed: int = None) -> tuple:
         """
         Returns (train_df, holdout_df, domain_metadata).
-
-        train_df  — the agent works on this (80% of data)
-        holdout_df — frozen, never modified (20% of data)
-        domain_metadata — known issues, rules, baseline accuracy
+        train_df   → agent works on this (80% of data)
+        holdout_df → frozen, never modified (20% of data)
         """
-        datasets = DIFFICULTY_TO_DATASETS.get(difficulty, ["adult_census"])
-        idx = self._rotation[difficulty] % len(datasets)
+        available = DIFFICULTY_TO_DATASETS.get(difficulty, ["adult_census"])
+        idx = self._rotation[difficulty] % len(available)
         self._rotation[difficulty] += 1
-        name = datasets[idx]
+        name = available[idx]
 
         meta = REGISTRY[name]
         df = self._load(name, meta)
 
-        # Stable train/holdout split — same seed → same split
         rng_seed = seed if seed is not None else 42
         train_df, holdout_df = train_test_split(
             df, test_size=0.20, random_state=rng_seed, stratify=df["label"]
         )
-        train_df = train_df.reset_index(drop=True)
-        holdout_df = holdout_df.reset_index(drop=True)
-
-        return train_df, holdout_df, meta
+        return train_df.reset_index(drop=True), holdout_df.reset_index(drop=True), meta
 
     def _load(self, name: str, meta: dict) -> pd.DataFrame:
         if name in self._cache:
@@ -184,7 +190,6 @@ class DatasetRegistry:
             self._cache[name] = df
             return df.copy()
 
-        # Download
         df = self._download(name, meta)
         df.to_csv(cache_path, index=False)
         self._cache[name] = df
@@ -204,21 +209,17 @@ class DatasetRegistry:
             df = ds.frame.copy()
             target_col = meta["target_column"]
 
-            # Standardize target → "label" column as int
             if target_col in df.columns:
                 df = df.rename(columns={target_col: "label"})
             else:
                 df["label"] = ds.target
 
-            # Encode label to 0/1
             le = LabelEncoder()
             df["label"] = le.fit_transform(df["label"].astype(str))
 
-            # Encode all object/categorical columns to numeric
             for col in df.select_dtypes(include=["object", "category"]).columns:
                 if col == "label":
                     continue
-                # Replace '?' (OpenML's missing value marker) with NaN
                 df[col] = df[col].replace("?", np.nan)
                 df[col] = LabelEncoder().fit_transform(df[col].astype(str))
 
@@ -226,8 +227,7 @@ class DatasetRegistry:
             return df
 
         except Exception as e:
-            # Fallback: generate enriched synthetic data with documented patterns
-            print(f"[DatasetRegistry] Could not download {name}: {e}. Using fallback.")
+            print(f"[DatasetRegistry] Could not download '{name}': {e}. Using fallback.")
             return self._synthetic_fallback(name, meta)
 
     def _load_breast_cancer(self) -> pd.DataFrame:
@@ -237,10 +237,7 @@ class DatasetRegistry:
         return df
 
     def _synthetic_fallback(self, name: str, meta: dict) -> pd.DataFrame:
-        """
-        Fallback: sklearn synthetic data with realistic properties
-        matching the real dataset's known issues.
-        """
+        """Enriched synthetic fallback that mirrors the real dataset's documented issues."""
         from sklearn.datasets import make_classification
         np.random.seed(42)
         n = 500
@@ -251,16 +248,11 @@ class DatasetRegistry:
         df = pd.DataFrame(X, columns=[f"feature_{i}" for i in range(10)])
         df["label"] = y
 
-        # Inject the documented issues from the real dataset
-        domain_rules = meta.get("domain_rules", {})
-
-        # Inject missing values (like real dataset)
         missing_rate = 0.12 if meta["difficulty_weight"] >= 2 else 0.05
         mask = np.random.random((n, 8)) < missing_rate
         for i in range(8):
             df.loc[mask[:, i], f"feature_{i}"] = np.nan
 
-        # Inject class imbalance if known
         if "imbalance" in str(meta.get("known_issues", [])).lower():
             minority_idx = df[df["label"] == 1].index
             drop_n = int(len(minority_idx) * 0.4)

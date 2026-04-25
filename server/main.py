@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 from typing import Optional
 
-from server.environment import DataCentricEnvironment
+from server.environment import DataCentricEnvironment, _registry
 from server.session_manager import session_manager
 from server.config import cfg
 from server.logger import get_logger, log_event
@@ -44,6 +44,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Pre-load all 5 real datasets in a background thread so the first /reset is instant."""
+    _registry.warmup()
+
 
 VALID_ACTIONS = {
     "query_cleaner", "query_augmenter", "query_balancer",
@@ -75,9 +82,7 @@ class ActionRequest(BaseModel):
     @classmethod
     def validate_action(cls, v):
         if v not in VALID_ACTIONS:
-            raise ValueError(
-                f"Invalid action '{v}'. Valid: {sorted(VALID_ACTIONS)}"
-            )
+            raise ValueError(f"Invalid action '{v}'. Valid: {sorted(VALID_ACTIONS)}")
         return v
 
     @field_validator("target_class")
@@ -93,13 +98,15 @@ class ActionRequest(BaseModel):
 @app.post("/reset", summary="Start a new episode")
 def reset(body: ResetRequest = None):
     """
-    Creates a new episode. Returns a `session_id` + full observation.
+    Creates a new episode on a real dataset. Returns `session_id` + full observation.
 
     The observation includes:
-    - Real dataset name, domain, and known quality issues
-    - Current accuracy vs target vs published baseline vs majority-class baseline
-    - Dataset statistics (missing %, balance ratio)
-    - Available actions
+    - Dataset name, domain, and documented known quality issues
+    - Current accuracy vs target vs published benchmark vs majority-class baseline
+    - Dataset statistics (missing %, class balance ratio)
+    - Feature importance (empty until first apply)
+    - Episode trace (empty at start)
+    - All pending recommendations (empty until first query)
     """
     difficulty = body.difficulty if body else None
     seed = body.seed if body else None
@@ -119,18 +126,18 @@ def step(body: ActionRequest):
     Take one action in the environment.
 
     **Query actions** (cost 1-2 budget, return recommendations):
-    - `query_cleaner` — missing value analysis, domain-aware (knows zeros=missing in medical)
-    - `query_augmenter` — minority class synthesis via SMOTE-like interpolation
-    - `query_balancer` — class resampling (oversample or undersample, explains tradeoff)
-    - `query_validator` (cost 2) — duplicate + outlier detection with domain-appropriate thresholds
-    - `query_analyst` (cost 2) — holistic diagnosis + prioritized action plan + published baseline reference
+    - `query_cleaner` (cost 1) — missing value + zero-as-missing analysis, domain-aware
+    - `query_augmenter` (cost 1) — minority class synthesis via SMOTE-like interpolation
+    - `query_balancer` (cost 1) — class resampling with explicit tradeoff explanation
+    - `query_validator` (cost 2) — duplicate + outlier detection (conservative IQR for medical)
+    - `query_analyst` (cost 2) — holistic diagnosis + prioritized plan + published baseline
 
-    **Apply action** (cost 0 budget, modifies dataset):
-    - `apply` with `rec_id` — apply a specific recommendation
-    - Returns: feature importance, regression explanation (if accuracy dropped), benchmark comparison
+    **Apply action** (modifies dataset, no budget cost):
+    - `apply` with `rec_id` — apply a recommendation by its ID from any previous query
+    - Response includes: feature importance (LogReg coefs), regression explanation if accuracy drops
 
     **Rollback action** (cost 1 budget, max 3/episode):
-    - `rollback` — undo last apply, restore previous dataset state
+    - `rollback` — undo the last apply and restore the previous dataset state
     """
     env = session_manager.get_env(body.session_id)
     if env is None:
@@ -148,7 +155,6 @@ def step(body: ActionRequest):
     result = env.step(action_dict)
 
     if "error" in result and "exploit" not in str(result):
-        # Log non-exploit errors as warnings (not 500s — always return JSON)
         log_event(logger, "step_error", session_id=body.session_id, error=result["error"])
 
     session_manager.increment_steps(body.session_id)
@@ -157,7 +163,7 @@ def step(body: ActionRequest):
 
 @app.get("/state/{session_id}", summary="Get current observation")
 def state(session_id: str):
-    """Current full observation including episode trace and benchmarks."""
+    """Current full observation including episode trace, benchmarks, and feature importance."""
     env = session_manager.get_env(session_id)
     if env is None:
         raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
@@ -167,13 +173,12 @@ def state(session_id: str):
 @app.get("/trajectory/{session_id}", summary="Full episode trajectory")
 def trajectory(session_id: str):
     """
-    Returns the complete episode trace: every query, apply, rollback, and exploit event,
-    with reward decompositions and accuracy deltas.
+    Complete episode trace — every step with reward, accuracy delta, and effect label.
 
     Useful for:
     - Offline reward model training
-    - Debugging why the agent made a particular decision
-    - Comparing strategies across episodes
+    - Debugging agent decisions
+    - Comparing strategy effectiveness across episodes
     """
     env = session_manager.get_env(session_id)
     if env is None:
@@ -188,9 +193,9 @@ def health():
         "version": cfg.ENV_VERSION,
         "active_sessions": session_manager.metrics()["active_sessions"],
         "real_datasets": [
-            "UCI Adult Census",
+            "UCI Adult Census Income",
             "Pima Indians Diabetes",
-            "Wisconsin Breast Cancer",
+            "Wisconsin Breast Cancer Diagnostic",
             "German Credit Risk",
             "Cleveland Heart Disease",
         ],

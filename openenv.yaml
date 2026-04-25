@@ -1,4 +1,245 @@
 name: datacentric-env
-version: 0.1.0
-description: RL environment for data-centric AI agent training
+version: 0.5.0
+description: >
+  An RL environment that trains an LLM to act as a data engineer.
+  The agent receives a real, messy tabular dataset (UCI Adult Census,
+  Pima Indians Diabetes, German Credit, Wisconsin Breast Cancer,
+  Cleveland Heart Disease) and a frozen classifier it cannot touch.
+  Its only job: fix the data until the classifier hits the accuracy
+  target — measured against published academic benchmarks.
+
 entry: server/main.py
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+endpoints:
+  reset:
+    method: POST
+    path: /reset
+    description: Start a new episode. Returns session_id + full observation.
+    body:
+      difficulty:
+        type: string
+        enum: [easy, medium, hard]
+        required: false
+        description: >
+          Difficulty tier selects which real dataset is used.
+          easy → UCI Adult Census or Wisconsin Breast Cancer
+          medium → Pima Diabetes or German Credit
+          hard → Cleveland Heart Disease
+      seed:
+        type: integer
+        required: false
+        description: Seed for reproducible train/holdout split.
+
+  step:
+    method: POST
+    path: /step
+    description: Take one action. Returns reward, decomposition, and rich diagnostics.
+    body:
+      session_id:
+        type: string
+        required: true
+        description: session_id from /reset response.
+      action:
+        type: string
+        required: true
+        enum:
+          - query_cleaner      # cost 1 — missing value analysis, domain-aware
+          - query_augmenter    # cost 1 — minority class synthesis (SMOTE-like)
+          - query_balancer     # cost 1 — class resampling with tradeoff explanation
+          - query_validator    # cost 2 — duplicate + outlier detection
+          - query_analyst      # cost 2 — holistic diagnosis + prioritized plan + published baseline
+          - apply              # cost 0 — apply a pending recommendation by rec_id
+          - rollback           # cost 1 — undo last apply (max 3 per episode)
+      rec_id:
+        type: string
+        required: false
+        description: Required when action=apply. Use rec_id from a previous query response.
+      target_class:
+        type: integer
+        required: false
+        description: Optional for query_augmenter. Specify which class (0 or 1) to augment.
+
+  state:
+    method: GET
+    path: /state/{session_id}
+    description: Current observation including episode trace and benchmarks.
+
+  trajectory:
+    method: GET
+    path: /trajectory/{session_id}
+    description: >
+      Full episode trajectory — every step with reward decomposition,
+      accuracy deltas, and effects. Useful for offline analysis and
+      reward model training.
+
+  health:
+    method: GET
+    path: /health
+    description: Health check. Returns version + active session count.
+
+  metrics:
+    method: GET
+    path: /metrics
+    description: Server-wide counters — sessions, steps, config.
+
+# ── Observation schema ────────────────────────────────────────────────────────
+observation:
+  session_id: string
+  dataset:
+    name: string          # e.g. "UCI Adult Census Income"
+    domain: string        # e.g. "income_prediction"
+    description: string
+    known_issues: list    # real documented quality problems
+    published_baseline: float  # academic benchmark to beat
+  current_accuracy: float
+  target_accuracy: float
+  accuracy_gap: float
+  budget_remaining: integer
+  difficulty: string
+  benchmarks:
+    majority_class_baseline: float   # lower bound — doing nothing
+    starting_accuracy: float         # accuracy before any agent action
+    improvement_over_start: float
+    improvement_over_baseline: float
+    published_baseline: float        # upper bound — literature result
+  dataset_stats:
+    n_train_rows: integer
+    n_holdout_rows: integer
+    n_cols: integer
+    missing_pct: float
+    balance_ratio: float
+  feature_importance:
+    top_positive: list   # features pushing toward class 1
+    top_negative: list   # features pushing toward class 0
+    note: string
+  episode_trace: list    # last 5 steps — what the agent tried and the effect
+  pending_recommendations: object
+  available_actions: string
+
+# ── Step response schema ──────────────────────────────────────────────────────
+step_response:
+  observation: object           # full observation (see above)
+  reward: float                 # aggregate reward, strictly in (0.001, 0.999)
+  reward_decomposition:         # all 5 grader scores
+    format:
+      score: float
+      weight: 0.15
+      contribution: float
+    accuracy:
+      score: float
+      weight: 0.35
+      contribution: float
+    quality:
+      score: float
+      weight: 0.20
+      contribution: float
+    efficiency:
+      score: float
+      weight: 0.15
+      contribution: float
+    completion:
+      score: float
+      weight: 0.15
+      contribution: float
+    aggregate: float
+  done: boolean
+  feature_importance: object    # only on apply steps
+  regression_explanation: object  # only when accuracy dropped
+  info:
+    action_type: string
+    prev_accuracy: float
+    new_accuracy: float
+    accuracy_delta: float
+    target_accuracy: float
+    published_baseline: float
+    improvement_over_start: float
+    improvement_over_majority_baseline: float
+    budget_remaining: integer
+    episode_step: integer
+    success: boolean
+    rollbacks_available: integer
+    data_integrity:
+      rows_before: integer
+      rows_after: integer
+      deletion_pct: float
+
+# ── Reward function ───────────────────────────────────────────────────────────
+reward:
+  type: multi_component
+  clamp: "(0.001, 0.999)"
+  components:
+    - name: format
+      weight: 0.15
+      description: Valid action with required fields
+    - name: accuracy
+      weight: 0.35
+      description: Progress toward published baseline target on frozen holdout
+    - name: quality
+      weight: 0.20
+      description: Missing% reduction + class balance improvement
+    - name: efficiency
+      weight: 0.15
+      description: Penalizes wasted steps and low-budget expensive queries
+    - name: completion
+      weight: 0.15
+      description: Bonus for hitting target, scaled by remaining budget
+
+# ── Anti-exploit rules ────────────────────────────────────────────────────────
+anti_exploit:
+  - rule: action_spam
+    description: Same action 3+ times consecutively → penalized
+  - rule: low_budget_expensive_query
+    description: Using cost-2 queries when budget ≤ 2 → penalized
+  - rule: duplicate_apply
+    description: Applying same rec_id twice → blocked
+  - rule: invalid_rec_id
+    description: Applying rec_id that doesn't exist → blocked
+  - rule: data_integrity_violation
+    description: Deleting >10% of training rows in one operation → blocked
+
+# ── Datasets ──────────────────────────────────────────────────────────────────
+datasets:
+  - name: UCI Adult Census Income
+    difficulty: easy
+    source: OpenML (adult, version 2)
+    published_baseline: 0.871
+    known_issues:
+      - "14% missing values encoded as '?'"
+      - "capital-gain is 97% zero, heavily right-skewed"
+      - "education and education-num are redundant"
+      - "76/24 class imbalance"
+
+  - name: Wisconsin Breast Cancer Diagnostic
+    difficulty: easy
+    source: sklearn built-in
+    published_baseline: 0.973
+    known_issues:
+      - "Highly correlated feature groups (mean/SE/worst)"
+      - "Outliers may represent rare aggressive tumors — dangerous to remove"
+
+  - name: Pima Indians Diabetes Dataset
+    difficulty: medium
+    source: OpenML (diabetes, version 1)
+    published_baseline: 0.770
+    known_issues:
+      - "Zeros in Glucose, BloodPressure, BMI are medically impossible (missing)"
+      - "49% of Insulin values are zero (missing)"
+      - "65/35 class imbalance"
+
+  - name: German Credit Risk
+    difficulty: medium
+    source: OpenML (credit-g, version 1)
+    published_baseline: 0.768
+    known_issues:
+      - "Mixed categorical + numeric features"
+      - "70/30 class imbalance"
+
+  - name: Cleveland Heart Disease
+    difficulty: hard
+    source: OpenML (heart-h, version 1)
+    published_baseline: 0.855
+    known_issues:
+      - "Small dataset — 303 rows total"
+      - "Real missing values in ca and thal features"
+      - "Target binarized from 0-4 severity scale"
