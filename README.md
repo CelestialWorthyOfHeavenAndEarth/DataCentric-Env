@@ -65,7 +65,7 @@ Trained agent achieves higher mean episode reward vs random baseline.
 
 ## Environment
 
-Live on HuggingFace: [link — set after deployment]
+Live on HuggingFace: [Aswini-Kumar/datacentric-env](https://huggingface.co/spaces/Aswini-Kumar/datacentric-env)
 
 API:
 - `POST /reset` — Start new episode, returns initial observation
@@ -78,6 +78,7 @@ API:
 - **Method**: GRPO via TRL + Unsloth
 - **Training script**: [training/train.py](training/train.py)
 - **Colab notebook**: [training/train.ipynb](training/train.ipynb)
+- **GitHub**: https://github.com/CelestialWorthyOfHeavenAndEarth/DataCentric-Env
 
 ## Quick Start
 

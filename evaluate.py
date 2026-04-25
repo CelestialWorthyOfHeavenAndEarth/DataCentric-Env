@@ -14,7 +14,7 @@ import argparse
 import matplotlib.pyplot as plt
 
 parser = argparse.ArgumentParser(description="Evaluate DataCentric-Env agent")
-parser.add_argument("--url", default="http://localhost:8000", help="Environment server URL")
+parser.add_argument("--url", default="https://aswini-kumar-datacentric-env.hf.space", help="Environment server URL")
 parser.add_argument("--episodes", type=int, default=20, help="Number of evaluation episodes")
 args = parser.parse_args()
 
