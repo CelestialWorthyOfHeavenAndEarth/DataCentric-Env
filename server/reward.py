@@ -1,64 +1,114 @@
-def compute(prev_accuracy, new_accuracy, prev_stats, new_stats, action, steps_taken, max_steps, budget_remaining, target_accuracy, relabeler_used):
+"""
+server/reward.py
+
+Multi-component reward function supporting both query and apply steps.
+
+CRITICAL REQUIREMENT: All reward values must be strictly between 0.0 and 1.0.
+Neither 0.0 nor 1.0 are valid. Valid range: (0.001 ... 0.999).
+
+Graders (all independent):
+  1. Format compliance (15%)  — valid action type and required fields
+  2. Accuracy improvement (35%) — progress toward target accuracy
+  3. Dataset quality (20%)    — missing% reduction + balance improvement
+  4. Efficiency (15%)         — penalize wasted steps and low-budget recklessness
+  5. Task completion (15%)    — did accuracy reach or approach the target?
+"""
+
+
+def clamp(v: float) -> float:
+    """Clamp to strictly open interval (0.001, 0.999)."""
+    return max(0.001, min(0.999, float(v)))
+
+
+def compute(
+    prev_accuracy: float,
+    new_accuracy: float,
+    prev_stats: dict,
+    new_stats: dict,
+    action: dict,
+    steps_taken: int,
+    max_steps: int,
+    budget_remaining: int,
+    target_accuracy: float,
+    step_type: str = "apply",   # "query" or "apply"
+    n_recs_returned: int = 0,   # for query steps
+) -> float:
     """
-    CRITICAL REQUIREMENT: All reward components must be graders strictly between
-    0.0 and 1.0 — exclusive. Neither 0.0 nor 1.0 are valid outputs.
-    Valid range: (0.001 ... 0.999)
+    Compute reward. Returns float strictly in (0.001, 0.999).
 
-    Each sub-grader scores one independent aspect and returns a value in (0.0, 1.0).
-    Final reward is a weighted average of all graders — also in (0.0, 1.0).
+    step_type="query"  → data did not change; reward reflects info quality
+    step_type="apply"  → data changed; reward reflects accuracy + quality improvement
     """
 
-    def clamp(v):
-        """Clamp to strictly open interval (0.0, 1.0)."""
-        return max(0.001, min(0.999, float(v)))
+    # ── Grader 1: Format compliance (independent of all other graders) ────────
+    valid_query_actions = {
+        "query_cleaner", "query_augmenter", "query_balancer",
+        "query_validator", "query_analyst",
+    }
+    action_type = action.get("action", "")
 
-    # --- Grader 1: Format compliance (independent) ---
-    # Did the agent produce a valid, well-formed action?
-    valid_agents = ["cleaner", "augmenter", "balancer", "relabeler", "validator"]
-    if not isinstance(action.get("agent"), str) or action.get("agent") not in valid_agents:
-        format_score = 0.001  # invalid agent — minimum non-zero
-    elif "target" not in action:
-        format_score = 0.4    # valid agent but incomplete fields
+    if action_type in valid_query_actions:
+        format_score = 0.999  # valid query action
+    elif action_type == "apply":
+        if action.get("rec_id"):
+            format_score = 0.999  # apply with rec_id
+        else:
+            format_score = 0.2    # apply missing rec_id
     else:
-        format_score = 0.999  # fully valid action format
+        format_score = 0.001  # completely invalid action
 
-    # --- Grader 2: Accuracy improvement ---
-    # How much did accuracy improve toward target?
+    # ── Grader 2: Accuracy improvement ────────────────────────────────────────
     delta_acc = new_accuracy - prev_accuracy
     remaining = max(0.001, target_accuracy - prev_accuracy)
     progress = delta_acc / remaining if remaining > 0 else 0.0
-    accuracy_score = clamp(0.5 + progress * 0.49)  # neutral at 0.5, better if improving
 
-    # --- Grader 3: Dataset quality improvement ---
-    # Combined missing value reduction + balance improvement
+    if step_type == "query":
+        # Query doesn't change data — neutral score
+        # Slight bonus if there was useful info returned (n_recs > 0)
+        info_bonus = 0.05 * min(n_recs_returned, 3)
+        accuracy_score = clamp(0.45 + info_bonus)
+    else:
+        accuracy_score = clamp(0.5 + progress * 0.49)
+
+    # ── Grader 3: Dataset quality improvement ────────────────────────────────
     missing_improvement = prev_stats["missing_pct"] - new_stats["missing_pct"]
     balance_improvement = new_stats["balance_ratio"] - prev_stats["balance_ratio"]
     quality_delta = (missing_improvement + balance_improvement) / 2.0
-    quality_score = clamp(0.5 + quality_delta * 2.0)
 
-    # --- Grader 4: Efficiency ---
-    # Did the agent improve anything at all? Penalize wasted steps.
-    nothing_changed = (delta_acc <= 0 and missing_improvement <= 0 and balance_improvement <= 0)
-    relabeler_overused = relabeler_used and budget_remaining < 3
-    if nothing_changed:
-        efficiency_score = 0.1   # wasted a step
-    elif relabeler_overused:
-        efficiency_score = 0.3   # used expensive tool recklessly
+    if step_type == "query":
+        quality_score = clamp(0.45)  # neutral for queries
     else:
-        # Reward using budget efficiently — more budget left = better
+        quality_score = clamp(0.5 + quality_delta * 2.0)
+
+    # ── Grader 4: Efficiency ──────────────────────────────────────────────────
+    nothing_changed = (
+        delta_acc <= 0
+        and missing_improvement <= 0
+        and balance_improvement <= 0
+    )
+    low_budget = budget_remaining <= 2
+
+    if step_type == "query" and low_budget:
+        # Querying when almost out of budget is reckless
+        efficiency_score = 0.15
+    elif step_type == "apply" and nothing_changed:
+        efficiency_score = 0.1   # applied a rec that did nothing
+    elif step_type == "query" and not low_budget:
+        efficiency_score = clamp(0.5 + (budget_remaining / max_steps) * 0.3)
+    else:
         efficiency_score = clamp(0.5 + (budget_remaining / max_steps) * 0.49)
 
-    # --- Grader 5: Task completion ---
-    # Did this action help reach the target threshold?
+    # ── Grader 5: Task completion ─────────────────────────────────────────────
     if new_accuracy >= target_accuracy:
-        # Success — reward scales with how much budget is left (efficiency bonus)
         completion_score = clamp(0.9 + (budget_remaining / max_steps) * 0.09)
     elif new_accuracy > prev_accuracy:
         completion_score = clamp(0.5 + (new_accuracy / target_accuracy) * 0.4)
+    elif step_type == "query" and n_recs_returned > 0:
+        completion_score = clamp(0.35)  # query produced useful info, small credit
     else:
-        completion_score = 0.1  # no progress toward target
+        completion_score = 0.1
 
-    # --- Weighted average — stays in (0.0, 1.0) by construction ---
+    # ── Weighted average ──────────────────────────────────────────────────────
     reward = (
         format_score     * 0.15 +
         accuracy_score   * 0.35 +
@@ -68,12 +118,13 @@ def compute(prev_accuracy, new_accuracy, prev_stats, new_stats, action, steps_ta
     )
 
     # Final safety clamp — must never be exactly 0.0 or 1.0
-    reward = clamp(reward)
-
-    return round(reward, 4)
+    return round(clamp(reward), 4)
 
 
-def compute_stats(df):
+def compute_stats(df) -> dict:
+    """Compute dataset quality statistics."""
+    if df is None or len(df) == 0:
+        return {"missing_pct": 0.0, "balance_ratio": 0.0}
     missing_pct = float(df.isnull().mean().mean())
     label_counts = df["label"].value_counts(normalize=True)
     balance_ratio = float(label_counts.min()) if len(label_counts) > 1 else 1.0
