@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+scikit-learn
+pandas
+imbalanced-learn
+numpy
+openenv
+requests
+matplotlib
+datasets

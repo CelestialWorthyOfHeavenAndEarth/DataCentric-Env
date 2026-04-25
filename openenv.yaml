@@ -1,0 +1,4 @@
+name: datacentric-env
+version: 0.1.0
+description: RL environment for data-centric AI agent training
+entry: server/main.py

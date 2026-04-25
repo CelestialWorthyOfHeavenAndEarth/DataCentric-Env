@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+datacentric-grpo/
+datacentric-grpo-final/
+results.png
+*.log
+.DS_Store
