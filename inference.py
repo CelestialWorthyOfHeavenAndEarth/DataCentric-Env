@@ -1,14 +1,7 @@
 """
-inference.py — Required by Phase 1/2 automated checks.
-Demonstrates a full episode using the query/apply pattern.
-
-The agent:
-  1. Calls query_analyst to get a prioritized action plan
-  2. Follows the plan — queries the recommended agent
-  3. Applies the top-priority recommendation
-  4. Repeats until done or budget exhausted
+inference.py — Phase 1/2 automated check entry point (v0.3).
+Demonstrates the full query/apply episode with session management.
 """
-
 import requests
 import sys
 import json
@@ -17,100 +10,96 @@ BASE_URL = "http://localhost:8000"
 
 
 def run_episode(base_url: str = BASE_URL):
-    print(f"DataCentric-Env v0.2 — Query/Apply Pattern")
-    print(f"Connecting to: {base_url}\n")
+    base_url = base_url.rstrip("/")
+    print(f"DataCentric-Env v0.3 | {base_url}\n")
 
-    # Phase 1: reset
-    obs = requests.post(f"{base_url}/reset", json={}, timeout=30)
-    assert obs.status_code == 200, f"Reset failed: {obs.status_code}"
-    obs = obs.json()
-    assert "current_accuracy" in obs
-    assert "budget_remaining" in obs
-    assert "available_actions" in obs
-    print(f"Phase 1 reset: PASS | accuracy={obs['current_accuracy']} | target={obs['target_accuracy']}")
+    # Phase 1: reset — get session_id
+    resp = requests.post(f"{base_url}/reset", json={}, timeout=30)
+    assert resp.status_code == 200, f"Reset failed: {resp.status_code} {resp.text}"
+    obs = resp.json()
+    assert "session_id" in obs, "Missing session_id in reset response"
+    assert "current_accuracy" in obs, "Missing current_accuracy"
+    assert "budget_remaining" in obs, "Missing budget_remaining"
+    assert "available_actions" in obs, "Missing available_actions"
 
-    # Phase 2: full episode using query/apply
-    step_count = 0
+    session_id = obs["session_id"]
+    print(f"Phase 1 reset: PASS")
+    print(f"  session_id     = {session_id}")
+    print(f"  accuracy       = {obs['current_accuracy']} -> target {obs['target_accuracy']}")
+    print(f"  budget         = {obs['budget_remaining']}")
+    print(f"  missing_pct    = {obs['dataset_stats']['missing_pct']}")
+    print(f"  balance_ratio  = {obs['dataset_stats']['balance_ratio']}\n")
+
+    # Phase 2: run a full episode
     rewards = []
+    step_count = 0
+    queried_agents = set()
 
-    while not obs.get("done", False):
+    while True:
         budget = obs.get("budget_remaining", 0)
-        if budget <= 0:
+        if budget <= 0 or obs.get("done"):
             break
 
-        # Step 1: query analyst if no pending recs yet, or low on info
         pending = obs.get("pending_recommendations", {})
+        stats = obs.get("dataset_stats", {})
 
-        if not pending:
-            # Start by asking analyst for a plan
-            result = requests.post(
-                f"{base_url}/step",
-                json={"action": "query_analyst"},
-                timeout=30,
-            ).json()
+        # Strategy: query analyst first, then follow plan, then apply
+        if not queried_agents:
+            action = {"session_id": session_id, "action": "query_analyst"}
+        elif not pending:
+            # Pick next agent based on dataset stats
+            if stats.get("missing_pct", 0) > 0.05 and "cleaner" not in queried_agents:
+                action = {"session_id": session_id, "action": "query_cleaner"}
+            elif stats.get("balance_ratio", 1.0) < 0.45 and "balancer" not in queried_agents:
+                action = {"session_id": session_id, "action": "query_balancer"}
+            elif "augmenter" not in queried_agents:
+                action = {"session_id": session_id, "action": "query_augmenter", "target_class": 1}
+            else:
+                break  # out of ideas
         else:
-            # Apply the first available pending recommendation
-            rec_id = next(iter(pending.keys()))
-            result = requests.post(
-                f"{base_url}/step",
-                json={"action": "apply", "rec_id": rec_id},
-                timeout=30,
-            ).json()
+            # Apply highest priority pending rec
+            best_rec_id = min(pending, key=lambda k: pending[k].get("priority", 99))
+            action = {"session_id": session_id, "action": "apply", "rec_id": best_rec_id}
 
-        if "error" in result:
-            print(f"  Step {step_count+1}: ERROR — {result['error']}")
+        result = requests.post(f"{base_url}/step", json=action, timeout=30)
+        assert result.status_code == 200, f"Step failed: {result.status_code} {result.text}"
+        result = result.json()
+
+        if "error" in result and "exploit_detected" not in result:
+            print(f"  Step {step_count+1}: ERROR - {result['error']}")
             break
 
-        reward = result.get("reward", 0)
+        reward = result.get("reward", 0.0)
         info = result.get("info", {})
         step_count += 1
         rewards.append(reward)
 
-        # Validate reward is in (0.0, 1.0)
         assert isinstance(reward, float), f"Reward must be float, got {type(reward)}"
-        assert 0.0 < reward < 1.0, f"Reward {reward} out of valid range (0.0, 1.0)"
+        assert 0.0 < reward < 1.0, f"Reward {reward} out of range (0.0, 1.0)"
 
         action_type = info.get("action_type", "?")
         if action_type == "query":
-            n_recs = info.get("n_recommendations", 0)
             agent = info.get("agent_queried", "?")
-            print(f"  Step {step_count:02d}: QUERY {agent:10s} -> {n_recs} recs | reward={reward:.4f} | budget={info.get('budget_remaining', '?')}")
+            queried_agents.add(agent)
+            n_recs = info.get("n_recommendations", 0)
+            print(f"  Step {step_count:02d}: QUERY  {agent:12s} -> {n_recs} recs | reward={reward:.4f} | budget={info.get('budget_remaining','?')}")
         else:
-            acc_before = info.get("prev_accuracy", "?")
-            acc_after = info.get("new_accuracy", "?")
-            print(f"  Step {step_count:02d}: APPLY {info.get('rec_type', '?'):15s} -> acc {acc_before}->{acc_after} | reward={reward:.4f} | success={info.get('success', False)}")
+            print(f"  Step {step_count:02d}: APPLY  {info.get('rec_type','?'):15s} -> {info.get('prev_accuracy','?'):.4f}->{info.get('new_accuracy','?'):.4f} | reward={reward:.4f} | success={info.get('success',False)}")
 
         obs = result.get("observation", obs)
 
         if result.get("done"):
-            print(f"\n  Episode done in {step_count} steps. Success={info.get('success', False)}")
+            print(f"\n  Episode done. Success={info.get('success', False)}")
             break
 
-        # Follow-up query if we just queried analyst — query the first recommended agent
-        query_result = result.get("query_result", {})
-        action_plan = query_result.get("action_plan", [])
-        if action_plan and step_count <= 2:
-            next_action = action_plan[0].get("action", "query_cleaner")
-            if budget - 1 > 0:
-                result2 = requests.post(
-                    f"{base_url}/step",
-                    json={"action": next_action},
-                    timeout=30,
-                ).json()
-                if "error" not in result2:
-                    reward2 = result2.get("reward", 0)
-                    rewards.append(reward2)
-                    step_count += 1
-                    info2 = result2.get("info", {})
-                    n_recs = info2.get("n_recommendations", 0)
-                    agent = info2.get("agent_queried", "?")
-                    print(f"  Step {step_count:02d}: QUERY {agent:10s} -> {n_recs} recs | reward={reward2:.4f}")
-                    obs = result2.get("observation", obs)
+    # Verify metrics endpoint
+    m = requests.get(f"{base_url}/metrics", timeout=10).json()
+    assert "sessions" in m, "Missing sessions in /metrics"
 
     print(f"\nPhase 2 full episode: PASS")
-    print(f"  Steps taken: {step_count}")
-    print(f"  Mean reward: {sum(rewards)/max(len(rewards),1):.4f}")
+    print(f"  Steps: {step_count} | Mean reward: {sum(rewards)/max(len(rewards),1):.4f}")
     print(f"  All {len(rewards)} rewards in (0.0, 1.0): {all(0.0 < r < 1.0 for r in rewards)}")
+    print(f"  Active sessions: {m['sessions']['active_sessions']}")
     print("\nAll automated checks passed.")
     return True
 
