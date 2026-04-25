@@ -1,3 +1,12 @@
+---
+title: DataCentric-Env
+emoji: 🧹
+colorFrom: purple
+colorTo: indigo
+sdk: docker
+pinned: false
+---
+
 # DataCentric-Env
 
 **An RL environment that trains an LLM to act as a data engineer.**
@@ -60,7 +69,7 @@ POST /step   →  Query a specialist agent
 | **CleanerAgent** | `query_cleaner` | Missing values + zero-as-missing (domain-aware) + log-transform for skewed features |
 | **AugmenterAgent** | `query_augmenter` | SMOTE-like interpolation to synthesize minority class rows |
 | **BalancerAgent** | `query_balancer` | Oversample/undersample with explicit tradeoff explanation |
-| **ValidatorAgent** | `query_validator` (cost 2) | Duplicates + outlier clipping (conservative 5× IQR for medical domains) |
+| **ValidatorAgent** | `query_validator` (cost 2) | Duplicates + outlier clipping (conservative 5x IQR for medical domains) |
 | **AnalystAgent** | `query_analyst` (cost 2) | Holistic diagnosis + prioritized action plan + published baseline reference |
 
 ### What's Domain-Aware
@@ -71,8 +80,8 @@ The CleanerAgent knows:
 - Redundant features (e.g. `education` + `education-num`) → recommend dropping one
 
 The ValidatorAgent knows:
-- In medical domains, use 5× IQR instead of 3× — outliers may be real rare conditions
-- In credit/income domains, use standard 3× IQR
+- In medical domains, use 5x IQR instead of 3x — outliers may be real rare conditions
+- In credit/income domains, use standard 3x IQR
 
 ---
 
@@ -121,7 +130,7 @@ When accuracy drops after an apply:
 ```json
 "regression_explanation": {
   "likely_cause": "large_augmentation_overfitting",
-  "suggestion": "Synthetic rows don't generalise to holdout. Try undersample_majority or rollback."
+  "suggestion": "Synthetic rows do not generalise to holdout. Try undersample_majority or rollback."
 }
 ```
 
@@ -179,10 +188,10 @@ ENV_URL = "https://aswini-kumar-datacentric-env.hf.space"
 | Rule | What it blocks |
 |---|---|
 | `action_spam` | Same query 3+ times in a row |
-| `low_budget_expensive_query` | Cost-2 queries when budget ≤ 2 |
+| `low_budget_expensive_query` | Cost-2 queries when budget is 2 or less |
 | `duplicate_apply` | Applying the same rec_id twice |
-| `invalid_rec_id` | Applying a rec_id that doesn't exist |
-| `data_integrity_violation` | Deleting >10% of training rows in one operation |
+| `invalid_rec_id` | Applying a rec_id that does not exist |
+| `data_integrity_violation` | Deleting more than 10% of training rows in one operation |
 
 ---
 
