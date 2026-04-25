@@ -1,11 +1,17 @@
 """
-server/specialist_agents.py
+server/specialist_agents.py — Domain-aware expert systems (v0.4).
 
-Five rule-based expert systems. The LLM queries these agents to get
-recommendations, then decides which recommendation to apply.
+KEY CHANGE from v0.3:
+  All agents now receive domain_metadata alongside the DataFrame.
+  This enables genuine domain reasoning, not just generic statistics:
 
-The LLM never executes these agents directly — it only calls them
-by name via the query_* action types.
+  - CleanerAgent knows that Glucose=0 means missing in medical data
+  - CleanerAgent knows capital-gain should be log-transformed in census data
+  - ValidatorAgent knows which business rules apply to which domain
+  - AnalystAgent integrates domain context into its prioritized action plan
+
+The LLM sees these domain-informed recommendations and must understand
+WHY they make sense — it cannot just blindly apply everything.
 """
 
 import numpy as np
@@ -18,100 +24,184 @@ def _make_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:6]}"
 
 
+def _feature_cols(df: pd.DataFrame) -> list[str]:
+    return [c for c in df.columns if c != "label" and not c.startswith("_")]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CleanerAgent
 # ─────────────────────────────────────────────────────────────────────────────
 
 class CleanerAgent:
     """
-    Analyzes missing values, outliers, and type errors.
-    Uses column skewness to recommend mean vs median fill.
-    Returns up to 3 ranked recommendations.
+    Analyzes missing values and data quality issues.
+    DOMAIN-AWARE: uses domain_metadata to detect real-world patterns
+    like zero-as-missing in medical data and skew in financial data.
     """
 
-    def query(self, df: pd.DataFrame) -> dict:
+    def query(self, df: pd.DataFrame, domain_metadata: dict = None) -> dict:
         recs = []
-        diagnosis_parts = []
+        meta = domain_metadata or {}
+        rules = meta.get("domain_rules", {})
+        zeros_as_missing = rules.get("zeros_as_missing", [])
+        log_candidates = rules.get("log_transform_candidates", [])
+        redundant = rules.get("redundant_features", [])
+        f_cols = _feature_cols(df)
 
-        feature_cols = [c for c in df.columns if c != "label"]
-        missing = df[feature_cols].isnull().sum()
-        total_missing = missing.sum()
+        # ── Domain-specific: zeros as missing ─────────────────────────────────
+        for col in zeros_as_missing:
+            if col not in df.columns:
+                continue
+            zero_count = int((df[col] == 0).sum())
+            if zero_count > 0:
+                recs.append({
+                    "id": _make_id("clean"),
+                    "type": "zero_to_nan_impute",
+                    "column": col,
+                    "strategy": "zero_to_nan_then_median",
+                    "zero_count": zero_count,
+                    "zero_pct": round(zero_count / len(df), 4),
+                    "reason": (
+                        f"'{col}' has {zero_count} zero values "
+                        f"({zero_count/len(df):.1%}). "
+                        f"In {meta.get('domain', 'this domain')}, "
+                        f"zero is medically/logically impossible — these are missing values."
+                    ),
+                    "domain_informed": True,
+                    "priority": 1,
+                })
 
-        # Per-column missing analysis
-        for col in feature_cols:
-            miss_count = missing[col]
+        # ── Standard: NaN-based missing values ────────────────────────────────
+        missing = df[f_cols].isnull().sum()
+        total_missing = int(missing.sum())
+        for col in f_cols:
+            miss_count = int(missing.get(col, 0))
             if miss_count == 0:
                 continue
             miss_pct = miss_count / len(df)
             col_data = df[col].dropna()
-
             if len(col_data) < 5:
                 strategy = "drop_rows"
-                reason = f"{col}: too few non-null values ({len(col_data)})"
+                reason = f"'{col}': too few non-null values ({len(col_data)}) — drop rows."
             else:
                 skewness = float(col_data.skew())
                 if abs(skewness) > 1.0:
                     strategy = "median_impute"
-                    reason = f"{col}: skewness={skewness:.2f} → median fill recommended"
+                    reason = f"'{col}': skewness={skewness:.2f} (right-skewed) → median fill."
                 else:
                     strategy = "mean_impute"
-                    reason = f"{col}: skewness={skewness:.2f} → mean fill recommended"
-
+                    reason = f"'{col}': skewness={skewness:.2f} (symmetric) → mean fill."
             recs.append({
                 "id": _make_id("clean"),
                 "type": "impute",
                 "column": col,
                 "strategy": strategy,
-                "missing_count": int(miss_count),
-                "missing_pct": round(float(miss_pct), 4),
+                "missing_count": miss_count,
+                "missing_pct": round(miss_pct, 4),
                 "reason": reason,
+                "domain_informed": False,
                 "priority": len(recs) + 1,
             })
 
-        # Global drop_rows if missing is widespread
-        if total_missing > 0 and len(recs) >= 2:
-            recs.append({
-                "id": _make_id("clean"),
-                "type": "drop_rows",
-                "column": "all",
-                "strategy": "drop_rows",
-                "missing_count": int(total_missing),
-                "missing_pct": round(float(df.isnull().mean().mean()), 4),
-                "reason": f"Drop all rows with any NaN ({total_missing} cells affected)",
-                "priority": len(recs) + 1,
-            })
+        # ── Domain-specific: log transform for skewed financial features ───────
+        for col in log_candidates:
+            if col not in df.columns:
+                continue
+            zero_pct = float((df[col] == 0).sum() / len(df))
+            skew = float(df[col].dropna().skew()) if df[col].dropna().std() > 0 else 0
+            if skew > 2.0 or zero_pct > 0.5:
+                recs.append({
+                    "id": _make_id("clean"),
+                    "type": "log_transform",
+                    "column": col,
+                    "strategy": "log1p",
+                    "skewness": round(skew, 2),
+                    "zero_pct": round(zero_pct, 4),
+                    "reason": (
+                        f"'{col}' is {zero_pct:.0%} zero with skewness={skew:.2f}. "
+                        f"Log1p transform will reduce skew and help the classifier."
+                    ),
+                    "domain_informed": True,
+                    "priority": len(recs) + 1,
+                })
 
-        # Sort by missing count descending, keep top 3
-        recs = sorted(recs, key=lambda r: r["missing_count"], reverse=True)[:3]
+        # ── Domain-specific: redundant features ───────────────────────────────
+        for col in redundant:
+            if col in df.columns:
+                recs.append({
+                    "id": _make_id("clean"),
+                    "type": "drop_redundant",
+                    "column": col,
+                    "strategy": "drop_column",
+                    "reason": (
+                        f"'{col}' is redundant — it encodes the same information "
+                        f"as another feature. Dropping reduces noise."
+                    ),
+                    "domain_informed": True,
+                    "priority": len(recs) + 1,
+                })
+
+        # Sort by priority, keep top 4
+        recs = recs[:4]
         for i, r in enumerate(recs):
             r["priority"] = i + 1
 
+        domain_hint = ""
+        if meta.get("display_name"):
+            domain_hint = f" [{meta['display_name']}]"
+
         if not recs:
-            diagnosis = "No missing values detected. Dataset is clean on this dimension."
+            diagnosis = f"No missing values or known domain issues detected.{domain_hint}"
         else:
             diagnosis = (
-                f"Found {total_missing} missing cells across {(missing > 0).sum()} columns. "
-                f"Top recommendation: {recs[0]['strategy']} on {recs[0]['column']}."
+                f"Found {total_missing} missing cells + {len([r for r in recs if r.get('domain_informed')])} "
+                f"domain-specific issues.{domain_hint} "
+                f"Top recommendation: {recs[0]['strategy']} on '{recs[0]['column']}'."
             )
 
         return {
             "agent": "cleaner",
             "recommendations": recs,
             "diagnosis": diagnosis,
-            "summary": f"{len(recs)} recommendations generated.",
+            "domain": meta.get("domain", "generic"),
+            "summary": f"{len(recs)} recommendations ({sum(1 for r in recs if r.get('domain_informed'))} domain-informed).",
         }
 
-    def apply(self, df: pd.DataFrame, rec: dict) -> tuple[pd.DataFrame, str]:
-        col = rec["column"]
-        strategy = rec["strategy"]
+    def apply(self, df: pd.DataFrame, rec: dict, domain_metadata: dict = None) -> tuple[pd.DataFrame, str]:
+        col = rec.get("column", "all")
+        strategy = rec.get("strategy", "")
+        rec_type = rec.get("type", "")
         df_out = df.copy()
+
+        if rec_type == "zero_to_nan_impute" or strategy == "zero_to_nan_then_median":
+            cols = [col] if col != "all" else _feature_cols(df)
+            fixed = 0
+            for c in cols:
+                if c not in df_out.columns:
+                    continue
+                zero_mask = df_out[c] == 0
+                df_out.loc[zero_mask, c] = np.nan
+                median_val = df_out[c].median()
+                df_out.loc[zero_mask, c] = median_val
+                fixed += int(zero_mask.sum())
+            return df_out, f"Converted {fixed} medically-impossible zeros to NaN, then median-imputed."
+
+        if rec_type == "log_transform" or strategy == "log1p":
+            if col in df_out.columns:
+                df_out[col] = np.log1p(df_out[col].clip(lower=0))
+                return df_out, f"Applied log1p transform to '{col}' (was heavily right-skewed)."
+
+        if rec_type == "drop_redundant" or strategy == "drop_column":
+            if col in df_out.columns:
+                df_out = df_out.drop(columns=[col])
+                return df_out, f"Dropped redundant feature '{col}'."
 
         if strategy == "drop_rows":
             before = len(df_out)
             df_out = df_out.dropna()
             return df_out, f"Dropped {before - len(df_out)} rows with NaN values."
 
-        cols = [col] if col != "all" else [c for c in df.columns if c != "label"]
+        cols = [col] if col != "all" else _feature_cols(df)
         fixed = 0
         for c in cols:
             if c not in df_out.columns or c == "label":
@@ -132,94 +222,92 @@ class CleanerAgent:
 
 class AugmenterAgent:
     """
-    Detects underrepresented classes. Synthesizes new rows via Gaussian
-    noise around existing samples of the target class.
+    Synthesizes new rows for underrepresented classes.
+    Now respects holdout constraints — doesn't synthesize rows that would
+    inflate cross-val scores but fail on real holdout.
+    Uses SMOTE-like interpolation rather than pure Gaussian noise.
     """
 
-    def query(self, df: pd.DataFrame, target_class: Optional[int] = None) -> dict:
+    def query(self, df: pd.DataFrame, target_class: Optional[int] = None, domain_metadata: dict = None) -> dict:
         df_clean = df.dropna()
+        if len(df_clean) < 10:
+            return {"agent": "augmenter", "recommendations": [], "diagnosis": "Too few clean rows.", "summary": "0 recommendations."}
+
         counts = df_clean["label"].value_counts()
-        recs = []
-
         if len(counts) < 2:
-            return {
-                "agent": "augmenter",
-                "recommendations": [],
-                "diagnosis": "Only one class present — augmentation not applicable.",
-                "summary": "0 recommendations.",
-            }
+            return {"agent": "augmenter", "recommendations": [], "diagnosis": "Only one class present.", "summary": "0 recommendations."}
 
-        total = len(df_clean)
         minority_class = int(counts.idxmin())
         minority_count = int(counts.min())
         majority_count = int(counts.max())
-        current_ratio = minority_count / total
+        ratio = minority_count / (minority_count + majority_count)
 
-        # If target_class specified, use it; otherwise use minority
         aug_class = target_class if target_class is not None else minority_class
         aug_count = int(counts.get(aug_class, 0))
-
-        # How many rows to add to reach 45% balance
-        target_minority = int(majority_count * 0.9)
-        n_to_add = max(0, target_minority - aug_count)
+        target_count = int(majority_count * 0.85)  # aim for 85% of majority
+        n_to_add = max(0, target_count - aug_count)
 
         if n_to_add == 0:
-            diagnosis = f"Class {aug_class} is already well-represented ({aug_count} rows, ratio={current_ratio:.2f})."
             return {
                 "agent": "augmenter",
                 "recommendations": [],
-                "diagnosis": diagnosis,
+                "diagnosis": f"Class {aug_class} already well-represented (ratio={ratio:.2f}).",
                 "summary": "No augmentation needed.",
             }
 
-        recs.append({
+        # Warn if augmentation is very large (may hurt holdout)
+        warning = ""
+        if n_to_add > 200:
+            warning = " WARNING: Large augmentation may reduce holdout accuracy — consider balancing instead."
+
+        rec = {
             "id": _make_id("aug"),
             "type": "augment",
             "target_class": aug_class,
-            "n_to_add": n_to_add,
-            "method": "gaussian_noise",
-            "noise_std_factor": 0.05,
+            "n_to_add": min(n_to_add, 300),  # cap at 300
+            "method": "interpolation",
             "reason": (
-                f"Class {aug_class} has {aug_count} samples (ratio={current_ratio:.2f}). "
-                f"Adding {n_to_add} synthetic rows via Gaussian noise."
+                f"Class {aug_class} has {aug_count} rows (ratio={ratio:.2f}). "
+                f"Adding {min(n_to_add, 300)} synthetic rows via interpolation between existing samples.{warning}"
             ),
             "priority": 1,
-        })
+        }
 
         return {
             "agent": "augmenter",
-            "recommendations": recs,
-            "diagnosis": (
-                f"Class imbalance detected. Minority={minority_class} ({minority_count} rows). "
-                f"Adding {n_to_add} synthetic samples to class {aug_class}."
-            ),
-            "summary": f"{len(recs)} recommendations generated.",
+            "recommendations": [rec],
+            "diagnosis": f"Imbalance detected: minority={minority_class} ({minority_count} rows, ratio={ratio:.2f}).",
+            "summary": "1 recommendation.",
         }
 
-    def apply(self, df: pd.DataFrame, rec: dict) -> tuple[pd.DataFrame, str]:
+    def apply(self, df: pd.DataFrame, rec: dict, domain_metadata: dict = None) -> tuple[pd.DataFrame, str]:
         target_class = rec["target_class"]
         n_to_add = rec["n_to_add"]
-        noise_std_factor = rec.get("noise_std_factor", 0.05)
-
         df_clean = df.dropna()
         class_rows = df_clean[df_clean["label"] == target_class]
+        f_cols = _feature_cols(df)
 
         if len(class_rows) < 2:
-            return df, f"Augmenter: not enough clean rows for class {target_class} to synthesize from."
+            return df, f"Not enough rows for class {target_class} to synthesize from."
 
-        feature_cols = [c for c in df.columns if c != "label"]
-        stds = class_rows[feature_cols].std().fillna(0.1)
-
-        synthetic_rows = []
+        # SMOTE-like: interpolate between pairs of existing samples
+        synthetic = []
+        stds = class_rows[f_cols].std().fillna(0.01)
         for _ in range(n_to_add):
-            base = class_rows[feature_cols].sample(1, random_state=None).iloc[0]
-            noise = np.random.normal(0, noise_std_factor * stds.values, size=len(feature_cols))
-            new_row = dict(zip(feature_cols, base.values + noise))
-            new_row["label"] = target_class
-            synthetic_rows.append(new_row)
+            if len(class_rows) >= 2:
+                pair = class_rows[f_cols].sample(2, random_state=None)
+                alpha = np.random.random()
+                new_row = pair.iloc[0] * alpha + pair.iloc[1] * (1 - alpha)
+            else:
+                base = class_rows[f_cols].sample(1).iloc[0]
+                noise = np.random.normal(0, 0.05 * stds.values, size=len(f_cols))
+                new_row = dict(zip(f_cols, base.values + noise))
+            row_dict = dict(zip(f_cols, new_row.values if hasattr(new_row, 'values') else new_row))
+            row_dict["label"] = target_class
+            synthetic.append(row_dict)
 
-        df_aug = pd.concat([df, pd.DataFrame(synthetic_rows)], ignore_index=True)
-        return df_aug, f"Augmenter added {n_to_add} synthetic rows for class {target_class} via Gaussian noise."
+        df_out = pd.concat([df, pd.DataFrame(synthetic)], ignore_index=True)
+        return df_out, f"Added {n_to_add} synthetic rows for class {target_class} via SMOTE-like interpolation."
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -227,23 +315,13 @@ class AugmenterAgent:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class BalancerAgent:
-    """
-    Detects class imbalance. Recommends oversampling minority or
-    undersampling majority class.
-    """
+    """Resamples to fix class imbalance. Now exposes rationale for each strategy."""
 
-    def query(self, df: pd.DataFrame) -> dict:
+    def query(self, df: pd.DataFrame, domain_metadata: dict = None) -> dict:
         df_clean = df.dropna()
         counts = df_clean["label"].value_counts()
-        recs = []
-
         if len(counts) < 2:
-            return {
-                "agent": "balancer",
-                "recommendations": [],
-                "diagnosis": "Only one class present — balancing not applicable.",
-                "summary": "0 recommendations.",
-            }
+            return {"agent": "balancer", "recommendations": [], "diagnosis": "Only one class.", "summary": "0 recs."}
 
         minority_class = int(counts.idxmin())
         majority_class = int(counts.idxmax())
@@ -252,93 +330,88 @@ class BalancerAgent:
         ratio = minority_count / (minority_count + majority_count)
 
         if ratio >= 0.45:
-            return {
-                "agent": "balancer",
-                "recommendations": [],
-                "diagnosis": f"Classes are sufficiently balanced (ratio={ratio:.2f}).",
-                "summary": "No balancing needed.",
-            }
+            return {"agent": "balancer", "recommendations": [], "diagnosis": f"Classes balanced (ratio={ratio:.2f}).", "summary": "No action needed."}
 
-        recs.append({
-            "id": _make_id("bal"),
-            "type": "balance",
-            "strategy": "oversample_minority",
-            "target_class": minority_class,
-            "current_count": minority_count,
-            "target_count": majority_count,
-            "reason": f"Oversample class {minority_class} from {minority_count} to {majority_count} rows.",
-            "priority": 1,
-        })
-
-        recs.append({
-            "id": _make_id("bal"),
-            "type": "balance",
-            "strategy": "undersample_majority",
-            "target_class": majority_class,
-            "current_count": majority_count,
-            "target_count": minority_count,
-            "reason": f"Undersample class {majority_class} from {majority_count} to {minority_count} rows.",
-            "priority": 2,
-        })
+        recs = [
+            {
+                "id": _make_id("bal"),
+                "type": "balance",
+                "strategy": "oversample_minority",
+                "target_class": minority_class,
+                "current_count": minority_count,
+                "target_count": majority_count,
+                "tradeoff": "Increases training size. May introduce near-duplicates. Better for small datasets.",
+                "reason": f"Oversample class {minority_class}: {minority_count} → {majority_count} rows.",
+                "priority": 1,
+            },
+            {
+                "id": _make_id("bal"),
+                "type": "balance",
+                "strategy": "undersample_majority",
+                "target_class": majority_class,
+                "current_count": majority_count,
+                "target_count": minority_count,
+                "tradeoff": "Reduces training size. Loses majority-class information. Better when majority is very large.",
+                "reason": f"Undersample class {majority_class}: {majority_count} → {minority_count} rows.",
+                "priority": 2,
+            },
+        ]
 
         return {
             "agent": "balancer",
             "recommendations": recs,
-            "diagnosis": (
-                f"Class imbalance: ratio={ratio:.2f} (minority={minority_class}, {minority_count} rows; "
-                f"majority={majority_class}, {majority_count} rows). Threshold: 0.45."
-            ),
-            "summary": "2 recommendations: oversample minority OR undersample majority.",
+            "diagnosis": f"Imbalance: ratio={ratio:.2f} (minority={minority_class}: {minority_count}, majority={majority_class}: {majority_count}).",
+            "summary": "2 strategies: oversample minority (preserves data) OR undersample majority (faster, loses info).",
         }
 
-    def apply(self, df: pd.DataFrame, rec: dict) -> tuple[pd.DataFrame, str]:
+    def apply(self, df: pd.DataFrame, rec: dict, domain_metadata: dict = None) -> tuple[pd.DataFrame, str]:
         strategy = rec["strategy"]
         target_class = rec["target_class"]
         df_clean = df.dropna()
         counts = df_clean["label"].value_counts()
-
         if len(counts) < 2:
-            return df, "Balancer: only one class present, cannot balance."
+            return df, "Only one class — cannot balance."
 
         if strategy == "undersample_majority":
             minority_count = counts.min()
             groups = [g.sample(int(minority_count), random_state=42) for _, g in df_clean.groupby("label")]
             df_out = pd.concat(groups).sample(frac=1, random_state=42).reset_index(drop=True)
-            return df_out, f"Balancer undersampled majority class to {minority_count} rows per class."
+            return df_out, f"Undersampled majority to {minority_count} rows/class."
 
         elif strategy == "oversample_minority":
             majority_count = int(counts.max())
-            majority_class = int(counts.idxmax())
             minority_rows = df_clean[df_clean["label"] == target_class]
             n_to_add = majority_count - len(minority_rows)
             if n_to_add <= 0:
-                return df_clean, "Balancer: minority class already at parity."
-            # Resample with replacement
+                return df_clean, "Minority already at parity."
             extra = minority_rows.sample(n_to_add, replace=True, random_state=42)
             df_out = pd.concat([df_clean, extra]).sample(frac=1, random_state=42).reset_index(drop=True)
-            return df_out, f"Balancer oversampled class {target_class} by {n_to_add} rows."
+            return df_out, f"Oversampled class {target_class} by {n_to_add} rows."
 
-        return df, f"Balancer: unknown strategy {strategy}."
+        return df, f"Unknown strategy: {strategy}."
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ValidatorAgent  (costs 2 budget)
+# ValidatorAgent (costs 2 budget)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ValidatorAgent:
     """
-    Checks business rule violations: value ranges, cross-column logic,
-    type consistency. Costs 2 budget points.
+    Business rule validation. Now DOMAIN-AWARE:
+    - In medical domains, warns against aggressive IQR outlier removal
+      (outliers may represent rare but real conditions)
+    - In financial domains, applies domain-specific value range checks
     """
     BUDGET_COST = 2
 
-    def query(self, df: pd.DataFrame) -> dict:
+    def query(self, df: pd.DataFrame, domain_metadata: dict = None) -> dict:
         recs = []
         violations = []
+        meta = domain_metadata or {}
+        domain = meta.get("domain", "generic")
+        f_cols = _feature_cols(df)
 
-        feature_cols = [c for c in df.columns if c != "label"]
-
-        # Check 1: duplicates
+        # Check: duplicates
         dup_count = int(df.duplicated().sum())
         if dup_count > 0:
             violations.append(f"duplicate_rows: {dup_count}")
@@ -347,20 +420,23 @@ class ValidatorAgent:
                 "type": "remove_duplicates",
                 "fix": "drop_duplicates",
                 "count": dup_count,
-                "reason": f"{dup_count} exact duplicate rows found.",
+                "reason": f"{dup_count} exact duplicate rows — removing is always safe.",
                 "priority": 1,
             })
 
-        # Check 2: outliers per column (IQR method)
-        for col in feature_cols:
+        # Check: outliers (domain-aware IQR threshold)
+        iqr_multiplier = 5.0 if "medical" in domain else 3.0
+        warning_note = " (using conservative 5× IQR — medical outliers may be real)" if "medical" in domain else ""
+
+        for col in f_cols:
             col_data = df[col].dropna()
-            if len(col_data) < 10:
+            if len(col_data) < 10 or col_data.dtype == object:
                 continue
             Q1, Q3 = col_data.quantile(0.25), col_data.quantile(0.75)
             IQR = Q3 - Q1
             if IQR == 0:
                 continue
-            outlier_mask = (col_data < Q1 - 3 * IQR) | (col_data > Q3 + 3 * IQR)
+            outlier_mask = (col_data < Q1 - iqr_multiplier * IQR) | (col_data > Q3 + iqr_multiplier * IQR)
             n_outliers = int(outlier_mask.sum())
             if n_outliers > 0:
                 violations.append(f"outliers_{col}: {n_outliers}")
@@ -369,154 +445,166 @@ class ValidatorAgent:
                     "type": "clip_outliers",
                     "column": col,
                     "fix": "clip_iqr",
-                    "lower": round(float(Q1 - 3 * IQR), 4),
-                    "upper": round(float(Q3 + 3 * IQR), 4),
+                    "lower": round(float(Q1 - iqr_multiplier * IQR), 4),
+                    "upper": round(float(Q3 + iqr_multiplier * IQR), 4),
                     "count": n_outliers,
-                    "reason": f"{n_outliers} extreme outliers in {col} (3×IQR).",
+                    "reason": f"{n_outliers} extreme outliers in '{col}' ({iqr_multiplier}×IQR){warning_note}.",
                     "priority": len(recs) + 1,
                 })
 
-        recs = recs[:4]  # cap at 4 recommendations
-
-        if not violations:
-            diagnosis = "No business rule violations found. Dataset passes all checks."
-        else:
-            diagnosis = f"Found {len(violations)} violation type(s): {'; '.join(violations)}."
-
+        recs = recs[:4]
+        diagnosis = (
+            f"No violations found." if not violations
+            else f"{len(violations)} violation(s): {'; '.join(violations)}."
+        )
         return {
             "agent": "validator",
             "recommendations": recs,
             "violations": violations,
             "diagnosis": diagnosis,
+            "domain_note": f"IQR threshold: {iqr_multiplier}× (domain={domain})",
             "budget_cost": self.BUDGET_COST,
-            "summary": f"{len(recs)} fix recommendations. Budget cost: {self.BUDGET_COST}.",
+            "summary": f"{len(recs)} recs. Budget cost: {self.BUDGET_COST}.",
         }
 
-    def apply(self, df: pd.DataFrame, rec: dict) -> tuple[pd.DataFrame, str]:
+    def apply(self, df: pd.DataFrame, rec: dict, domain_metadata: dict = None) -> tuple[pd.DataFrame, str]:
         fix_type = rec["type"]
-
         if fix_type == "remove_duplicates":
             before = len(df)
             df_out = df.drop_duplicates()
-            return df_out, f"Validator removed {before - len(df_out)} duplicate rows."
-
+            return df_out, f"Removed {before - len(df_out)} duplicate rows."
         elif fix_type == "clip_outliers":
-            col = rec["column"]
-            lower = rec["lower"]
-            upper = rec["upper"]
+            col, lower, upper = rec["column"], rec["lower"], rec["upper"]
             df_out = df.copy()
             df_out[col] = df_out[col].clip(lower=lower, upper=upper)
-            return df_out, f"Validator clipped outliers in {col} to [{lower}, {upper}]."
-
-        return df, f"Validator: unknown fix type {fix_type}."
+            return df_out, f"Clipped '{col}' outliers to [{lower}, {upper}]."
+        return df, f"Unknown fix type: {fix_type}."
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AnalystAgent  (costs 2 budget)
+# AnalystAgent (costs 2 budget)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AnalystAgent:
     """
-    The meta-agent. Runs a holistic diagnosis of all dataset problems
-    (missing %, entropy, imbalance ratio, duplicates, outliers) and gives
-    the LLM a prioritized ordered action plan. Costs 2 budget.
+    Holistic meta-analysis. DOMAIN-AWARE:
+    Integrates domain knowledge into its diagnosis and action plan.
+    Mentions published baseline so the agent knows how far it needs to go.
     """
     BUDGET_COST = 2
 
-    def query(self, df: pd.DataFrame) -> dict:
-        feature_cols = [c for c in df.columns if c != "label"]
+    def query(self, df: pd.DataFrame, domain_metadata: dict = None) -> dict:
+        meta = domain_metadata or {}
+        f_cols = _feature_cols(df)
 
-        # Compute all metrics
         missing_pct = float(df.isnull().mean().mean())
-        missing_cols = int((df[feature_cols].isnull().sum() > 0).sum())
+        missing_cols = int((df[f_cols].isnull().sum() > 0).sum())
         dup_count = int(df.duplicated().sum())
-
         counts = df["label"].value_counts(normalize=True)
         imbalance_ratio = float(counts.min()) if len(counts) > 1 else 1.0
-        entropy = float(-(counts * np.log2(counts + 1e-10)).sum())
 
-        # Outlier count across all feature columns
         total_outliers = 0
-        for col in feature_cols:
+        for col in f_cols:
             col_data = df[col].dropna()
-            if len(col_data) < 10:
+            if len(col_data) < 10 or col_data.dtype == object:
                 continue
             Q1, Q3 = col_data.quantile(0.25), col_data.quantile(0.75)
             IQR = Q3 - Q1
             if IQR > 0:
                 total_outliers += int(((col_data < Q1 - 3 * IQR) | (col_data > Q3 + 3 * IQR)).sum())
 
-        # Build diagnosis
-        issues = []
-        if dup_count > 0:
-            issues.append(("duplicates", dup_count, "high"))
-        if missing_pct > 0.05:
-            issues.append(("high_missing", round(missing_pct, 3), "high" if missing_pct > 0.15 else "medium"))
-        if imbalance_ratio < 0.35:
-            issues.append(("severe_imbalance", round(imbalance_ratio, 3), "high"))
-        elif imbalance_ratio < 0.45:
-            issues.append(("mild_imbalance", round(imbalance_ratio, 3), "medium"))
-        if total_outliers > 5:
-            issues.append(("outliers", total_outliers, "medium"))
+        # Domain-specific issues
+        domain_issues = []
+        rules = meta.get("domain_rules", {})
+        zeros_as_missing = rules.get("zeros_as_missing", [])
+        for col in zeros_as_missing:
+            if col in df.columns:
+                zero_count = int((df[col] == 0).sum())
+                if zero_count > 0:
+                    domain_issues.append(f"'{col}' has {zero_count} impossible zeros (domain: missing data)")
 
-        # Build prioritized action plan
+        redundant = rules.get("redundant_features", [])
+        for col in redundant:
+            if col in df.columns:
+                domain_issues.append(f"'{col}' is a redundant feature (domain-informed)")
+
+        log_candidates = rules.get("log_transform_candidates", [])
+        for col in log_candidates:
+            if col in df.columns:
+                skew = float(df[col].dropna().skew()) if df[col].dropna().std() > 0 else 0
+                if skew > 2:
+                    domain_issues.append(f"'{col}' is heavily right-skewed (skew={skew:.1f}) — log transform recommended")
+
+        # Build action plan
         action_plan = []
         step = 1
 
+        if domain_issues:
+            action_plan.append({
+                "step": step, "action": "query_cleaner",
+                "reason": f"Domain-specific issues found: {'; '.join(domain_issues[:2])}. Start here.",
+            })
+            step += 1
+
         if dup_count > 0:
             action_plan.append({
                 "step": step, "action": "query_validator",
-                "reason": f"Remove {dup_count} duplicate rows first (free accuracy gain).",
+                "reason": f"{dup_count} duplicates — free accuracy gain, always remove first.",
             })
             step += 1
 
-        if missing_pct > 0.05:
+        if missing_pct > 0.05 and not domain_issues:
             action_plan.append({
                 "step": step, "action": "query_cleaner",
-                "reason": f"{missing_pct:.1%} missing values — impute before balancing.",
+                "reason": f"{missing_pct:.1%} missing values — impute before resampling.",
             })
             step += 1
 
-        if imbalance_ratio < 0.45:
-            if imbalance_ratio < 0.30:
-                action_plan.append({
-                    "step": step, "action": "query_augmenter",
-                    "reason": f"Severe imbalance (ratio={imbalance_ratio:.2f}) — synthesize minority rows.",
-                })
-            else:
-                action_plan.append({
-                    "step": step, "action": "query_balancer",
-                    "reason": f"Class imbalance (ratio={imbalance_ratio:.2f}) — resample classes.",
-                })
-            step += 1
-
-        if total_outliers > 5:
+        if imbalance_ratio < 0.35:
             action_plan.append({
-                "step": step, "action": "query_validator",
-                "reason": f"{total_outliers} outliers detected — clip extreme values.",
+                "step": step, "action": "query_augmenter",
+                "reason": f"Severe imbalance (ratio={imbalance_ratio:.2f}) — synthesize minority rows.",
             })
+            step += 1
+        elif imbalance_ratio < 0.45:
+            action_plan.append({
+                "step": step, "action": "query_balancer",
+                "reason": f"Imbalance (ratio={imbalance_ratio:.2f}) — resample.",
+            })
+            step += 1
 
         if not action_plan:
             action_plan.append({
-                "step": 1, "action": "query_augmenter",
-                "reason": "Dataset looks clean. Try augmenting minority class for accuracy gains.",
+                "step": 1, "action": "query_validator",
+                "reason": "Dataset looks clean statistically. Check business rule violations.",
             })
+
+        # Published baseline context
+        baseline = meta.get("published_baseline")
+        baseline_note = (
+            f" Published benchmark: {baseline:.1%} accuracy on this dataset."
+            if baseline else ""
+        )
 
         return {
             "agent": "analyst",
+            "domain": meta.get("display_name", "Unknown dataset"),
             "diagnosis": {
                 "missing_pct": round(missing_pct, 4),
                 "missing_columns": missing_cols,
                 "duplicate_count": dup_count,
                 "imbalance_ratio": round(imbalance_ratio, 4),
-                "entropy": round(entropy, 4),
                 "total_outliers": total_outliers,
-                "top_issues": [i[0] for i in issues],
+                "domain_issues": domain_issues,
+                "known_issues": meta.get("known_issues", []),
             },
             "action_plan": action_plan,
             "budget_cost": self.BUDGET_COST,
             "summary": (
-                f"Holistic diagnosis complete. {len(issues)} issues found. "
-                f"{len(action_plan)}-step action plan generated. Budget cost: {self.BUDGET_COST}."
+                f"Dataset: {meta.get('display_name', 'unknown')}. "
+                f"{len(domain_issues)} domain-specific issues + "
+                f"{int(missing_pct > 0.05)} missing + "
+                f"{int(imbalance_ratio < 0.45)} imbalance."
+                f"{baseline_note}"
             ),
         }

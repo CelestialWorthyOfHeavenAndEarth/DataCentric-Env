@@ -1,16 +1,20 @@
 """
-server/main.py — Production FastAPI application (v0.3).
+server/main.py — Production FastAPI application (v0.5).
 
 Endpoints:
-  POST /reset              — Start new episode, returns session_id
-  POST /step               — Take action (requires session_id)
-  GET  /state/{session_id} — Get current observation
-  GET  /health             — Health check
-  GET  /metrics            — Session + episode metrics
+  POST /reset                   — Start new episode (returns session_id + full observation)
+  POST /step                    — Take action (query | apply | rollback)
+  GET  /state/{session_id}      — Current observation
+  GET  /trajectory/{session_id} — Full episode trace with all rewards and effects
+  GET  /health                  — Health check + version
+  GET  /metrics                 — Session counts + config
+  GET  /docs                    — Swagger UI (auto-generated)
 """
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 from typing import Optional
+
 from server.environment import DataCentricEnvironment
 from server.session_manager import session_manager
 from server.config import cfg
@@ -22,24 +26,36 @@ app = FastAPI(
     title="DataCentric-Env",
     version=cfg.ENV_VERSION,
     description=(
-        "RL environment: LLM acts as data engineer. "
-        "Query specialist agents for recommendations, apply them to fix a dataset, "
-        "hit the accuracy target."
+        "RL environment: an LLM acts as a data engineer. "
+        "Given a real, messy tabular dataset (UCI Adult, Pima Diabetes, German Credit, etc.), "
+        "the agent queries specialist agents for recommendations and applies them to fix the data "
+        "until the frozen classifier hits the accuracy target. "
+        "All scores compared against published academic baselines.\n\n"
+        "**New in v0.5:** Rollback action, episode reasoning trace, feature importance, "
+        "regression explanations, benchmark comparisons."
     ),
     docs_url="/docs",
     redoc_url="/redoc",
 )
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 VALID_ACTIONS = {
     "query_cleaner", "query_augmenter", "query_balancer",
-    "query_validator", "query_analyst", "apply",
+    "query_validator", "query_analyst", "apply", "rollback",
 }
 
 
-# ── Request models ─────────────────────────────────────────────────────────────
+# ── Request models ──────────────────────────────────────────────────────────────
 
 class ResetRequest(BaseModel):
     difficulty: Optional[str] = None
+    seed: Optional[int] = None
 
     @field_validator("difficulty")
     @classmethod
@@ -60,7 +76,7 @@ class ActionRequest(BaseModel):
     def validate_action(cls, v):
         if v not in VALID_ACTIONS:
             raise ValueError(
-                f"Invalid action '{v}'. Must be one of: {sorted(VALID_ACTIONS)}"
+                f"Invalid action '{v}'. Valid: {sorted(VALID_ACTIONS)}"
             )
         return v
 
@@ -72,25 +88,50 @@ class ActionRequest(BaseModel):
         return v
 
 
-# ── Endpoints ──────────────────────────────────────────────────────────────────
+# ── Endpoints ───────────────────────────────────────────────────────────────────
 
 @app.post("/reset", summary="Start a new episode")
 def reset(body: ResetRequest = None):
-    difficulty = body.difficulty if body else None
+    """
+    Creates a new episode. Returns a `session_id` + full observation.
 
-    # Create new session + environment
-    session_id = "pending"  # placeholder before create_session
+    The observation includes:
+    - Real dataset name, domain, and known quality issues
+    - Current accuracy vs target vs published baseline vs majority-class baseline
+    - Dataset statistics (missing %, balance ratio)
+    - Available actions
+    """
+    difficulty = body.difficulty if body else None
+    seed = body.seed if body else None
+
     env = DataCentricEnvironment(session_id="pending", episode_count=0)
     session_id = session_manager.create_session(env)
-    env.session_id = session_id  # patch in the real ID
+    env.session_id = session_id
 
-    obs = env.reset(difficulty=difficulty)
+    obs = env.reset(difficulty=difficulty, seed=seed)
     log_event(logger, "api_reset", session_id=session_id, difficulty=obs.get("difficulty"))
     return obs
 
 
-@app.post("/step", summary="Take an action in the environment")
+@app.post("/step", summary="Take an action")
 def step(body: ActionRequest):
+    """
+    Take one action in the environment.
+
+    **Query actions** (cost 1-2 budget, return recommendations):
+    - `query_cleaner` — missing value analysis, domain-aware (knows zeros=missing in medical)
+    - `query_augmenter` — minority class synthesis via SMOTE-like interpolation
+    - `query_balancer` — class resampling (oversample or undersample, explains tradeoff)
+    - `query_validator` (cost 2) — duplicate + outlier detection with domain-appropriate thresholds
+    - `query_analyst` (cost 2) — holistic diagnosis + prioritized action plan + published baseline reference
+
+    **Apply action** (cost 0 budget, modifies dataset):
+    - `apply` with `rec_id` — apply a specific recommendation
+    - Returns: feature importance, regression explanation (if accuracy dropped), benchmark comparison
+
+    **Rollback action** (cost 1 budget, max 3/episode):
+    - `rollback` — undo last apply, restore previous dataset state
+    """
     env = session_manager.get_env(body.session_id)
     if env is None:
         raise HTTPException(
@@ -105,16 +146,39 @@ def step(body: ActionRequest):
         action_dict["target_class"] = body.target_class
 
     result = env.step(action_dict)
+
+    if "error" in result and "exploit" not in str(result):
+        # Log non-exploit errors as warnings (not 500s — always return JSON)
+        log_event(logger, "step_error", session_id=body.session_id, error=result["error"])
+
     session_manager.increment_steps(body.session_id)
     return result
 
 
 @app.get("/state/{session_id}", summary="Get current observation")
 def state(session_id: str):
+    """Current full observation including episode trace and benchmarks."""
     env = session_manager.get_env(session_id)
     if env is None:
         raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
     return env.state()
+
+
+@app.get("/trajectory/{session_id}", summary="Full episode trajectory")
+def trajectory(session_id: str):
+    """
+    Returns the complete episode trace: every query, apply, rollback, and exploit event,
+    with reward decompositions and accuracy deltas.
+
+    Useful for:
+    - Offline reward model training
+    - Debugging why the agent made a particular decision
+    - Comparing strategies across episodes
+    """
+    env = session_manager.get_env(session_id)
+    if env is None:
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+    return env.episode_summary()
 
 
 @app.get("/health", summary="Health check")
@@ -123,10 +187,17 @@ def health():
         "status": "ok",
         "version": cfg.ENV_VERSION,
         "active_sessions": session_manager.metrics()["active_sessions"],
+        "real_datasets": [
+            "UCI Adult Census",
+            "Pima Indians Diabetes",
+            "Wisconsin Breast Cancer",
+            "German Credit Risk",
+            "Cleveland Heart Disease",
+        ],
     }
 
 
-@app.get("/metrics", summary="Episode and session metrics")
+@app.get("/metrics", summary="Server metrics")
 def metrics():
     return {
         "version": cfg.ENV_VERSION,
@@ -134,8 +205,9 @@ def metrics():
             "max_budget": cfg.MAX_BUDGET,
             "max_concurrent_sessions": cfg.MAX_CONCURRENT_SESSIONS,
             "session_ttl_seconds": cfg.SESSION_TTL_SECONDS,
-            "golden_row_count": cfg.GOLDEN_ROW_COUNT,
             "max_same_action_streak": cfg.MAX_SAME_ACTION_STREAK,
+            "max_row_deletion_pct": 0.10,
+            "max_rollbacks_per_episode": 3,
         },
         "sessions": session_manager.metrics(),
     }

@@ -1,15 +1,17 @@
 """
-server/reward.py — Multi-component reward function (v0.3).
+server/reward.py — Multi-component reward function (v0.4).
 
-CRITICAL: All reward values must be strictly in (0.001, 0.999).
+CRITICAL: All reward values strictly in (0.001, 0.999). Never 0.0 or 1.0.
+
+Returns (aggregate_reward, decomposition_dict) — researchers can see
+exactly which grader is driving behavior.
 
 Graders:
   1. Format compliance (15%)  — valid action + required fields
-  2. Accuracy improvement (35%) — progress toward target
+  2. Accuracy delta (35%)     — progress toward published baseline target
   3. Dataset quality (20%)    — missing% + balance improvement
   4. Efficiency (15%)         — penalize wasted steps, low-budget queries
-  5. Task completion (10%)    — did accuracy reach target?
-  6. Golden row integrity (5%) — penalize corrupting canonical rows
+  5. Task completion (15%)    — did accuracy reach target?
 """
 
 
@@ -20,6 +22,14 @@ def clamp(v: float) -> float:
 VALID_QUERY_ACTIONS = {
     "query_cleaner", "query_augmenter", "query_balancer",
     "query_validator", "query_analyst",
+}
+
+WEIGHTS = {
+    "format":     0.15,
+    "accuracy":   0.35,
+    "quality":    0.20,
+    "efficiency": 0.15,
+    "completion": 0.15,
 }
 
 
@@ -35,22 +45,24 @@ def compute(
     target_accuracy: float,
     step_type: str = "apply",
     n_recs_returned: int = 0,
-    golden_penalty: float = 0.0,
-) -> float:
-    """Returns float strictly in (0.001, 0.999)."""
+) -> tuple[float, dict]:
+    """
+    Returns (aggregate_reward, decomposition_dict).
+    Both strictly in (0.001, 0.999).
+    """
 
-    # ── Grader 1: Format compliance (INDEPENDENT of all other graders) ────────
+    # ── Grader 1: Format compliance (INDEPENDENT) ─────────────────────────────
     action_type = action.get("action", "")
     if action_type in VALID_QUERY_ACTIONS:
         format_score = 0.999
     elif action_type == "apply" and action.get("rec_id"):
         format_score = 0.999
     elif action_type == "apply":
-        format_score = 0.2    # missing rec_id
+        format_score = 0.2
     else:
-        format_score = 0.001  # completely invalid
+        format_score = 0.001
 
-    # ── Grader 2: Accuracy improvement ────────────────────────────────────────
+    # ── Grader 2: Accuracy delta ──────────────────────────────────────────────
     delta_acc = new_accuracy - prev_accuracy
     remaining = max(0.001, target_accuracy - prev_accuracy)
     progress = delta_acc / remaining if remaining > 0 else 0.0
@@ -62,8 +74,8 @@ def compute(
         accuracy_score = clamp(0.5 + progress * 0.49)
 
     # ── Grader 3: Dataset quality improvement ────────────────────────────────
-    missing_improvement = prev_stats["missing_pct"] - new_stats["missing_pct"]
-    balance_improvement = new_stats["balance_ratio"] - prev_stats["balance_ratio"]
+    missing_improvement = prev_stats.get("missing_pct", 0) - new_stats.get("missing_pct", 0)
+    balance_improvement = new_stats.get("balance_ratio", 0) - prev_stats.get("balance_ratio", 0)
     quality_delta = (missing_improvement + balance_improvement) / 2.0
 
     if step_type == "query":
@@ -96,28 +108,36 @@ def compute(
     else:
         completion_score = 0.1
 
-    # ── Grader 6: Golden row integrity ────────────────────────────────────────
-    # golden_penalty is in [0.0, 1.0] where 0 = no corruption, 1 = all golden rows lost
-    integrity_score = clamp(1.0 - golden_penalty * 0.9)  # maps [0,1] → [0.1, 0.999]
+    # ── Weighted aggregate ────────────────────────────────────────────────────
+    scores = {
+        "format":     format_score,
+        "accuracy":   accuracy_score,
+        "quality":    quality_score,
+        "efficiency": efficiency_score,
+        "completion": completion_score,
+    }
 
-    # ── Weighted average ──────────────────────────────────────────────────────
-    reward = (
-        format_score     * 0.15 +
-        accuracy_score   * 0.35 +
-        quality_score    * 0.20 +
-        efficiency_score * 0.15 +
-        completion_score * 0.10 +
-        integrity_score  * 0.05
-    )
+    reward = sum(scores[k] * WEIGHTS[k] for k in WEIGHTS)
+    reward = round(clamp(reward), 4)
 
-    return round(clamp(reward), 4)
+    decomposition = {
+        name: {
+            "score": round(scores[name], 4),
+            "weight": WEIGHTS[name],
+            "contribution": round(scores[name] * WEIGHTS[name], 4),
+        }
+        for name in WEIGHTS
+    }
+    decomposition["aggregate"] = reward
+
+    return reward, decomposition
 
 
 def compute_stats(df) -> dict:
     if df is None or len(df) == 0:
         return {"missing_pct": 0.0, "balance_ratio": 0.0}
-    feature_cols = [c for c in df.columns if c not in ("_archetype",)]
-    missing_pct = float(df[feature_cols].isnull().mean().mean())
+    feature_cols = [c for c in df.columns if not c.startswith("_") and c != "label"]
+    missing_pct = float(df[feature_cols].isnull().mean().mean()) if feature_cols else 0.0
     label_counts = df["label"].value_counts(normalize=True)
     balance_ratio = float(label_counts.min()) if len(label_counts) > 1 else 1.0
     return {"missing_pct": missing_pct, "balance_ratio": balance_ratio}
